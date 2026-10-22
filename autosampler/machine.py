@@ -6,6 +6,7 @@ import threading
 from contextlib import contextmanager
 
 from autosampler.config import MachineConfig
+from autosampler.calibration import calibration_issues, geometry_errors, measurements, set_value, save_calibration
 from autosampler.controllers.interfaces import GrblController, ScaleController
 from autosampler.errors import (
     ConnectionFailure,
@@ -60,6 +61,33 @@ class AutosamplerMachine:
         )
         self._command_lock = threading.RLock()
         self._abort_generation = 0
+        self.calibration_file = None
+
+    def calibration_issues(self):
+        return calibration_issues(self.config, self.inventory.vessels)
+
+    def record_calibration(self, key: str, value: float, confirmed: bool = False):
+        """Record an operator measurement without moving or establishing position trust."""
+        from copy import deepcopy
+
+        if confirmed is not True:
+            raise ValidationError("Calibration requires explicit operator confirmation.")
+        with self._command_lock:
+            if self.state.current_operation:
+                raise ValidationError("Wait for motion to finish before recording calibration.")
+            spec = next((m for m in measurements(self.inventory.vessels) if m.key == key), None)
+            if spec is None:
+                raise ValidationError("Unknown calibration measurement.")
+            candidate = deepcopy(self.config)
+            value = spec.validate(value)
+            set_value(candidate, key, value)
+            errors = geometry_errors(candidate)
+            if errors:
+                raise ValidationError("; ".join(errors))
+            if self.calibration_file:
+                save_calibration(candidate, self.calibration_file, self.inventory.vessels)
+            set_value(self.config, key, value)
+            log.info("OPERATOR_CONFIRMED_CALIBRATION %s=%s", key, value)
 
     @contextmanager
     def _operation(
@@ -85,6 +113,10 @@ class AutosamplerMachine:
                 raise RecoveryRequired("Machine is in recovery-required state; Home is required.")
             if self.state.abort_requested:
                 raise OperationAborted("Operation was aborted.")
+            if not allow_calibration_bypass:
+                issues = self.calibration_issues()
+                if issues:
+                    raise MissingCalibration("Automated operations locked; calibration required: " + "; ".join(issues))
             previous = self.state.current_operation
             self.state.current_operation = name
             self.state.operation_state = OperationState.BUSY
@@ -341,7 +373,6 @@ class AutosamplerMachine:
 
     def go_to_spot(self, location_id: str, pipette: PipetteId) -> int:
         with self._operation("go_to_spot"):
-            self._move_z_safe()
             mapping = (
                 self.config.pipette_1_positions_deg
                 if pipette is PipetteId.P1
@@ -350,6 +381,7 @@ class AutosamplerMachine:
             angle = mapping.get(location_id)
             if angle is None:
                 raise MissingCalibration(f"Carousel position for {location_id} using {pipette.value} has not been calibrated.")
+            self._move_z_safe()
             target = degrees_to_steps(angle)
             self.grbl.move_absolute(Axis.CAROUSEL.value, float(target))
             self.state.carousel_steps = target
@@ -380,7 +412,7 @@ class AutosamplerMachine:
         if cfg.max_travel_mm is None:
             raise MissingCalibration(f"{cfg.name} maximum safe travel has not been calibrated.")
         travel = volume_ul / cfg.volume_per_mm_ul
-        if travel > cfg.max_travel_mm + 1e-9:
+        if cfg.contact_position_mm + travel > cfg.max_travel_mm + 1e-9:
             raise ValidationError(f"{cfg.name} requested travel exceeds maximum safe travel.")
         return travel
 
@@ -404,6 +436,10 @@ class AutosamplerMachine:
         self.state.pipette_contents_ul[pipette.value] = max(0.0, held - volume_ul)
 
     def empty_pipette(self, pipette: PipetteId) -> float:
+        with self._operation("empty_pipette"):
+            return self._empty_pipette(pipette)
+
+    def _empty_pipette(self, pipette: PipetteId) -> float:
         cfg = self._pipette_config(pipette)
         if cfg.max_travel_mm is None:
             raise MissingCalibration(f"{cfg.name} maximum safe travel has not been calibrated.")
@@ -442,6 +478,8 @@ class AutosamplerMachine:
             self.state.scale_reading = baseline
             height = aspiration_height_mm(self._geometry(source), source.quantity_ul, immersion)
             z_target = self.config.z.aspiration_machine_offset_mm + height
+            if abs(z_target - self.config.z.home_position_mm) > self.config.z.max_travel_mm:
+                raise ValidationError("Aspiration target exceeds calibrated Z travel.")
             self.grbl.move_absolute(Axis.Z.value, z_target)
             correction = target
             measured = 0.0

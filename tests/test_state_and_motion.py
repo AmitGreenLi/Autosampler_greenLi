@@ -101,6 +101,13 @@ def test_raw_step_conversion_for_z(configured_machine):
     assert result["integer_steps"] == 80
 
 
+@pytest.mark.parametrize("axis", (Axis.PIPETTE_1, Axis.PIPETTE_2))
+def test_nema17_pipette_raw_steps_use_one_sixteenth_microstepping(configured_machine, axis):
+    result = configured_machine.move_axis(axis, 1600, "steps")
+    assert result["grbl_amount"] == 1.0
+    assert result["integer_steps"] == 1600
+
+
 def test_raw_steps_must_be_integral(configured_machine):
     with pytest.raises(ValidationError):
         configured_machine.move_axis(Axis.CAROUSEL, 1.2, "steps")

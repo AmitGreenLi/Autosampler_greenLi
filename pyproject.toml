@@ -22,6 +22,9 @@ autosampler = "autosampler.main:main"
 [tool.setuptools.packages.find]
 include = ["autosampler*"]
 
+[tool.setuptools.package-data]
+autosampler = ["assets/*.png"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

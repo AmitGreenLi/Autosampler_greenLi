@@ -13,8 +13,17 @@ CAROUSEL_DRIVER_GEAR_TEETH = 12
 CAROUSEL_DRIVEN_GEAR_TEETH = 112
 CAROUSEL_STEPS_PER_DEGREE = 140 / 27
 Z_STEPS_PER_MM = 80.0
-PIPETTE_1_STEPS_PER_MM = 10.0
-PIPETTE_2_STEPS_PER_MM = 10.0
+PIPETTE_MICROSTEPS = 16
+PIPETTE_MOTOR_FULL_STEPS_PER_REV = 200
+PIPETTE_TRAVEL_MM_PER_REV = 2.0
+PIPETTE_1_FULL_STEPS_PER_MM = (
+    PIPETTE_MOTOR_FULL_STEPS_PER_REV / PIPETTE_TRAVEL_MM_PER_REV
+)
+PIPETTE_2_FULL_STEPS_PER_MM = (
+    PIPETTE_MOTOR_FULL_STEPS_PER_REV / PIPETTE_TRAVEL_MM_PER_REV
+)
+PIPETTE_1_STEPS_PER_MM = PIPETTE_1_FULL_STEPS_PER_MM * PIPETTE_MICROSTEPS
+PIPETTE_2_STEPS_PER_MM = PIPETTE_2_FULL_STEPS_PER_MM * PIPETTE_MICROSTEPS
 VIAL_MAX_VOLUME_ML = 15.0
 BEAKER_MAX_VOLUME_ML = 100.0
 
@@ -86,10 +95,14 @@ class MachineConfig:
     scale: AandFzScaleConfig = field(default_factory=lambda: AandFzScaleConfig(None, 2400))
     z: ZConfig = field(default_factory=ZConfig)
     pipette_1: PipetteConfig = field(
-        default_factory=lambda: PipetteConfig("Pipette 1", AXIS_PIPETTE_1, 10.0, 200.0)
+        default_factory=lambda: PipetteConfig(
+            "Pipette 1", AXIS_PIPETTE_1, PIPETTE_1_STEPS_PER_MM, 200.0
+        )
     )
     pipette_2: PipetteConfig = field(
-        default_factory=lambda: PipetteConfig("Pipette 2", AXIS_PIPETTE_2, 10.0, 10_000.0)
+        default_factory=lambda: PipetteConfig(
+            "Pipette 2", AXIS_PIPETTE_2, PIPETTE_2_STEPS_PER_MM, 10_000.0
+        )
     )
     transfer: TransferConfig = field(default_factory=TransferConfig)
     # Location -> calibrated carousel angle. Pipette offsets stay independent.

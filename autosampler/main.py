@@ -36,7 +36,12 @@ def build_runtime(mock_mode=True, paths=None, device_config_path=None):
         grbl, scale = MockGrblController(), MockScaleController()
     else:
         grbl, scale = SerialGrblController(config.grbl), SerialScaleController(config.scale)
-    return AutosamplerMachine(config, grbl, scale), paths, preferences
+    machine = AutosamplerMachine(config, grbl, scale)
+    # Simulation measurements must never unlock real hardware.
+    machine.calibration_file = paths.config_dir / ("calibration-mock.json" if mock_mode else "calibration.json")
+    from autosampler.calibration import load_calibration
+    load_calibration(config, machine.calibration_file, machine.inventory.vessels)
+    return machine, paths, preferences
 
 
 def build_machine(hardware=False):
@@ -57,12 +62,23 @@ def _parser():
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
     mock_mode = not args.hardware
+    if sys.platform == "win32":
+        # Give the process its own Windows taskbar identity instead of inheriting
+        # the generic Python executable identity.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "DIYCNCAutosampler.Control"
+            )
+        except (AttributeError, OSError):
+            pass
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
-    from autosampler.gui import AutosamplerWindow
+    from autosampler.gui import AutosamplerWindow, application_icon
 
     application = QApplication(sys.argv[:1] if argv is not None else sys.argv)
     application.setApplicationName("DIY CNC Autosampler")
+    application.setWindowIcon(application_icon())
     machine, paths, preferences = build_runtime(mock_mode, device_config_path=args.config)
     window = AutosamplerWindow(machine, paths, preferences, mock_mode)
     window.showFullScreen() if args.fullscreen else window.show()

@@ -66,7 +66,8 @@ Runtime state is not written into the installed source directory. `platformdirs`
 - Current vessel/session state: user data directory
 - GRBL/scale device associations: user configuration directory
 - Operational log: user log directory
-- Machine constants and currently unset physical calibration: typed project configuration
+- Machine constants: typed project configuration
+- Operator-confirmed calibration: `calibration.json` in the user configuration directory (`calibration-mock.json` in simulation)
 
 If the original development `autosampler_state.json` exists beside the source, it is copied to the new session location on first startup and retained as a legacy backup. Physical coordinates are never persisted as trusted state.
 
@@ -82,7 +83,7 @@ If GRBL disappears, the failed operation stops, the controller is marked disconn
 - Homing can run the complete `$H` cycle or one GRBL-Mega-5X axis command (`$HX`, `$HZ`, `$HA`, `$HB`) from the GUI. Partial homing remains untrusted until all four application axes have been homed.
 - Homing uses a separate five-minute response window because GRBL sends its final `ok` only after the physical homing cycle completes; ordinary serial commands retain the short device timeout.
 - Carousel conversion remains `140/27` full motor steps per degree with integer Python targets.
-- Z remains 80 steps/mm; A and B retain the theoretical 10 steps/mm starting values.
+- Z remains 80 steps/mm. A and B use standard 1.8° NEMA17 motors (200 full steps/revolution), 2 mm of actuator travel per motor revolution, and 1/16 DRV8825 microstepping: `200 / 2 × 16 = 1600` driver steps/mm.
 - Exactly 200 µL uses P1. The existing 1.1 mL and 10 mL planning boundaries are unchanged.
 - Dispense always dumps afterward and never cleans automatically.
 - Cleaning returns liquid to the Cleaning Beaker.
@@ -129,6 +130,21 @@ The Manual Calibration tab shows the selected axis's signed commanded step posit
 This bypass does **not** establish coordinates: X/Z/A/B positions remain unknown, absolute/high-level commands remain blocked, and the application continues to show recovery-required state. Home exits the bypass and establishes trusted coordinates. Unchecking it disables bypass jogging; Abort, reset, USB loss, or disconnect also clears it automatically.
 
 Before using `$X`, manually confirm that the requested axis and direction have collision-free travel. `$X` only clears a GRBL alarm; it does not establish machine zero, validate switch state, or replace a physical emergency stop.
+
+## Guided calibration
+
+The **Manual Calibration** tab includes a guided measurement form. Add the intended vessel locations on the Vessels tab first, then work through **Next missing measurement**:
+
+1. Home the relevant axis to establish its reference. Check the physical travel path before each small manual jog. Never seek a mechanical stop automatically.
+2. Measure Z maximum travel, collision-free clearance, dispense position, and the vessel-bottom machine offset. Enter signed positions relative to home; maximum travel is a positive distance.
+3. Measure A/P1 and B/P2 contact positions, safe upper coordinates, and volume per millimetre. A full rated-volume stroke from contact must fit below the safe upper coordinate. These axes currently use positive strokes from home.
+4. Verify speeds and accelerations against the installed firmware and enter transfer/scale settings. Recording these values does not program GRBL settings or verify physical motion limits.
+5. Align every vessel separately for P1 and P2 and record its carousel angle from X home in degrees. The existing integer-step conversion remains unchanged.
+6. For each entry, check **I physically verified this measurement and its reference / units**, then select **Record confirmed measurement**. Editing the value or selecting another measurement clears confirmation.
+
+Recording a measurement sends no hardware commands. Values are validated and saved atomically into typed configuration; simulation and hardware use separate files. Restarting loads measurements but never restores homing or position trust. Invalid calibration files fail startup rather than partially loading. Session reset does not erase axis calibration.
+
+The status lists missing measurements. All automated commands remain locked until required Z, A, B, transfer, and both pipettes' carousel values are valid for every configured vessel. Adding a vessel requires its two new carousel measurements. The machine API enforces the same lock before automated motion. Home and manual calibration jogging remain available; Abort/disconnection still require recovery and Home even after calibration is complete.
 
 ## Tests
 
