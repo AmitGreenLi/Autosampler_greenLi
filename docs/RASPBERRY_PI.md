@@ -30,13 +30,18 @@ A graphical session and a working Qt platform plugin are required. For a local X
 
 ## Serial devices
 
+For a two-Pi installation where the touchscreen app runs on the operator Pi
+and GRBL and the scale attach to a glovebox Pi, follow
+[Glovebox Pi USB serial bridge](GLOVEBOX_BRIDGE.md). Local USB mode remains
+available on either Pi and on Windows.
+
 Linux commonly exposes USB serial devices as:
 
 - `/dev/ttyACM*`
 - `/dev/ttyUSB*`
 - stable aliases beneath `/dev/serial/by-id/`
 
-The application enumerates devices with pySerial, displays their USB metadata, and saves GRBL/scale identities separately from the assigned path. It will not select the first enumerated device. If a saved identity is missing or ambiguous, the operator must choose. Reconnecting never restores trusted coordinates; Home is required.
+The application enumerates devices with pySerial, displays their USB metadata, and saves GRBL/scale identities separately from the assigned path. If exactly one serial port is detected during first setup, it is preselected for GRBL but never connected automatically; verify that it is the GRBL adapter before pressing Connect. If multiple devices have no saved identities, the operator must assign their roles once. A serial-less adapter can be recognized later by its VID:PID and physical USB location, so keep identical adapters in their assigned USB sockets. Ambiguous devices are never selected automatically. Reconnecting never restores trusted coordinates; Home is required.
 
 For the A&D FZ-500i RS-232-to-USB adapter, retain the same balance-side profile used during Windows development: 2400 baud, 7 data bits, even parity, one stop bit, CR/LF, and A&D standard format. The controller sends `Q` queries and normalizes reported mass to grams. Prefer the adapter's `/dev/serial/by-id/...` alias when available, but save its USB identity through the application as well.
 

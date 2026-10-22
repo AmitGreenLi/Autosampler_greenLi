@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from autosampler.position_tracking import PositionTracking
 
 
 class Axis(str, Enum):
@@ -42,6 +43,7 @@ class ScaleReading:
 
 @dataclass
 class MachineState:
+    reported_position: PositionTracking = field(default_factory=PositionTracking)
     grbl_connected: bool = False
     scale_connected: bool = False
     homed: bool = False
@@ -62,6 +64,8 @@ class MachineState:
     )
     operation_state: OperationState = OperationState.IDLE
     current_operation: str | None = None
+    homing_progress: str | None = None
+    homing_axis_started_at: float | None = None
     abort_requested: bool = False
     calibration_unlocked: bool = False
     scale_reading: ScaleReading | None = None
@@ -75,7 +79,9 @@ class MachineState:
 
         return steps_to_degrees(self.carousel_steps)
 
-    def invalidate_position(self, reason: str | None = None) -> None:
+    def invalidate_position(self, reason: str | None = None, *, invalidate_measurement: bool = True) -> None:
+        if invalidate_measurement:
+            self.reported_position.invalidate()
         self.homed = False
         self.position_trusted = False
         self.carousel_referenced = False

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 import queue
+import sys
+import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot, Qt
@@ -19,7 +24,9 @@ from autosampler.models import Axis, OperationState, PipetteId
 from autosampler.vessels.inventory import Inventory
 from autosampler.vessels.models import Vessel, VesselCategory, VesselType
 from autosampler.worker import MachineWorker
-from autosampler.calibration import measurements, get_value
+from autosampler.calibration import measurements, get_value, aspiration_measurement_help
+from autosampler.remote_serial import DEFAULT_GLOVEBOX_TARGET, discover_remote_devices
+from autosampler.errors import OperationAborted
 
 APP_ICON_PATH = Path(__file__).resolve().parent.parent / "assets" / "app_icon.png"
 
@@ -39,6 +46,20 @@ class QtLogHandler(logging.Handler):
 
     def emit(self, record):
         self.emitter.message.emit(self.format(record))
+
+
+class RemoteDiscoveryBridge(QObject):
+    completed = Signal(str, str, object)
+    failed = Signal(str, str, object)
+
+    def start(self, purpose: str, target: str):
+        def run():
+            try:
+                self.completed.emit(purpose, target, discover_remote_devices(target))
+            except Exception as exc:
+                self.failed.emit(purpose, target, exc)
+
+        threading.Thread(target=run, name="glovebox-discovery", daemon=True).start()
 
 
 class QtWorkerBridge(QObject):
@@ -108,8 +129,13 @@ class AutosamplerWindow(QMainWindow):
         self.mock_mode = mock_mode
         self._unlock_pending = False
         self._limit_poll_pending = False
+        self._manual_command_pending = False
+        self._command_inflight = None
         self._vessel_table_dirty = False
         self.serial_devices = []
+        self.remote_discovery = RemoteDiscoveryBridge(self)
+        self.remote_discovery.completed.connect(self._remote_discovery_completed)
+        self.remote_discovery.failed.connect(self._remote_discovery_failed)
         self.worker = MachineWorker()
         self.worker.start()
         self.bridge = QtWorkerBridge(self.worker, machine, self)
@@ -140,6 +166,8 @@ class AutosamplerWindow(QMainWindow):
         self.limit_timer.timeout.connect(self._poll_limit_status)
         self.limit_timer.start()
         self._render_state(self.machine.state)
+        if not self.mock_mode and sys.platform.startswith("linux") and os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+            QTimer.singleShot(0, self._probe_glovebox)
 
     def _build_ui(self):
         central = QWidget()
@@ -153,7 +181,7 @@ class AutosamplerWindow(QMainWindow):
         safety_layout.setSpacing(6)
         safety_layout.addWidget(QLabel("Emergency stop"))
         self.abort_button = QPushButton("ABORT")
-        self.abort_button.setToolTip("Immediately stop motion and require Home before continuing.")
+        self.abort_button.setToolTip("Sends feed hold then RESET. Reset can release motor holding torque and allow gravity-loaded axes to fall. Position becomes untrusted; recovery and Home are required.")
         self.abort_button.clicked.connect(self.abort)
         safety_layout.addWidget(self.abort_button)
         self.tabs.setCornerWidget(safety_corner, Qt.Corner.TopRightCorner)
@@ -201,16 +229,26 @@ class AutosamplerWindow(QMainWindow):
     def _connection_panel(self):
         group = QGroupBox("Connections and safety")
         grid = QGridLayout(group)
+        self.device_source = QComboBox()
+        self.device_source.addItems(("Local USB", "Glovebox Pi over USB"))
+        self.device_source.currentIndexChanged.connect(self.refresh_devices)
+        self.glovebox_target = QLineEdit(DEFAULT_GLOVEBOX_TARGET)
+        self.glovebox_target.setToolTip("SSH user and USB-network address of the inner Pi")
+        self.glovebox_target.editingFinished.connect(self.refresh_devices)
+        grid.addWidget(QLabel("Device source"), 0, 0)
+        grid.addWidget(self.device_source, 0, 1, 1, 2)
+        grid.addWidget(QLabel("Glovebox SSH"), 0, 3)
+        grid.addWidget(self.glovebox_target, 0, 4)
         self.grbl_devices, self.scale_devices = QComboBox(), QComboBox()
         self.grbl_devices.setEditable(True)
         self.scale_devices.setEditable(True)
-        grid.addWidget(QLabel("GRBL device"), 0, 0)
-        grid.addWidget(self.grbl_devices, 0, 1, 1, 3)
-        grid.addWidget(QLabel("Scale device"), 1, 0)
-        grid.addWidget(self.scale_devices, 1, 1, 1, 3)
-        refresh = QPushButton("Refresh devices")
-        refresh.clicked.connect(self.refresh_devices)
-        grid.addWidget(refresh, 0, 4, 2, 1)
+        grid.addWidget(QLabel("GRBL device"), 1, 0)
+        grid.addWidget(self.grbl_devices, 1, 1, 1, 3)
+        grid.addWidget(QLabel("Scale device"), 2, 0)
+        grid.addWidget(self.scale_devices, 2, 1, 1, 3)
+        self.refresh_button = QPushButton("Refresh devices")
+        self.refresh_button.clicked.connect(self.refresh_devices)
+        grid.addWidget(self.refresh_button, 1, 4, 2, 1)
         controls = QHBoxLayout()
         self.grbl_connection_button = QPushButton("Connect GRBL")
         self.grbl_connection_button.clicked.connect(self.toggle_grbl_connection)
@@ -222,7 +260,11 @@ class AutosamplerWindow(QMainWindow):
         self.home_axis.addItem("All axes", None)
         for label, axis in self.AXIS_LABELS.items():
             self.home_axis.addItem(label, axis.value)
-        self.home_axis.setToolTip("Choose the complete $H cycle or one GRBL-Mega-5X axis homing command.")
+        self.home_axis.setToolTip(
+            f"Home all runs Z, X, A, then B. Z uses $25={self.machine.config.z_homing_search_rate:g}; "
+            f"X searches at {self.machine.config.carousel_homing_search_deg_s:g} degrees/second. "
+            "Each restores the previous search setting afterward."
+        )
         controls.addWidget(self.home_axis)
         self.home_button = QPushButton("Home selected")
         self.home_button.clicked.connect(self.home_selected)
@@ -236,13 +278,13 @@ class AutosamplerWindow(QMainWindow):
         diagnostics = QPushButton("Diagnostics")
         diagnostics.clicked.connect(self.show_diagnostics)
         controls.addWidget(diagnostics)
-        grid.addLayout(controls, 2, 0, 1, 5)
+        grid.addLayout(controls, 3, 0, 1, 5)
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
         self.scale_readout = QLabel("Scale: disconnected")
         self.scale_readout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.scale_readout.setMinimumHeight(58)
-        grid.addWidget(self.scale_readout, 3, 0, 1, 5)
+        grid.addWidget(self.scale_readout, 4, 0, 1, 5)
         limit_row = QHBoxLayout()
         limit_row.addWidget(QLabel("Limit switches"))
         self.limit_indicators = {}
@@ -257,8 +299,33 @@ class AutosamplerWindow(QMainWindow):
             self.limit_indicators[axis.value] = indicator
             limit_row.addWidget(indicator)
         limit_row.addStretch(1)
-        grid.addLayout(limit_row, 4, 0, 1, 5)
-        grid.addWidget(self.status_label, 5, 0, 1, 5)
+        grid.addLayout(limit_row, 5, 0, 1, 5)
+        grid.addWidget(self.status_label, 6, 0, 1, 5)
+        self.connection_homing_progress = QLabel()
+        self.connection_homing_progress.setWordWrap(True)
+        grid.addWidget(self.connection_homing_progress, 7, 0, 1, 5)
+        terminal = QGroupBox("Manual G-code command")
+        terminal_layout = QVBoxLayout(terminal)
+        help_text = QLabel(
+            "Available before calibration. Sends the exact command entered (for example G1, $$, $100=1). "
+            "Raw commands can move the machine or change settings; check the travel path. "
+            "Home is required afterward for automated operations."
+        )
+        help_text.setWordWrap(True)
+        terminal_layout.addWidget(help_text)
+        command_row = QHBoxLayout()
+        self.manual_command_input = QLineEdit()
+        self.manual_command_input.setPlaceholderText("Enter a G-code or controller command")
+        self.manual_command_input.setAccessibleName("Manual G-code command")
+        self.manual_command_input.returnPressed.connect(self.send_manual_command)
+        self.manual_command_input.textChanged.connect(lambda: self._render_manual_controls())
+        command_row.addWidget(self.manual_command_input, 1)
+        self.manual_send_button = QPushButton("Send")
+        self.manual_send_button.clicked.connect(self.send_manual_command)
+        command_row.addWidget(self.manual_send_button)
+        terminal_layout.addLayout(command_row)
+        terminal_layout.addWidget(QLabel("Commands, responses, and errors appear in the operation log below."))
+        grid.addWidget(terminal, 8, 0, 1, 5)
         return group
 
     def _calibration_panel(self):
@@ -273,13 +340,15 @@ class AutosamplerWindow(QMainWindow):
         layout.addWidget(self.axis_combo, 1, 0)
         layout.addWidget(self.unit_combo, 1, 1)
         layout.addWidget(self.move_amount, 1, 2)
-        move = QPushButton("Move")
+        move = self.move_button = QPushButton("Move")
         move.clicked.connect(self.move_axis)
         layout.addWidget(move, 1, 3)
         jog = QHBoxLayout()
+        self.jog_buttons = []
         for value in (-10, -1, -0.1, 0.1, 1, 10):
             button = QPushButton(f"{value:+g}")
             button.clicked.connect(lambda _checked=False, v=value: self.jog(v))
+            self.jog_buttons.append(button)
             jog.addWidget(button)
         layout.addLayout(jog, 2, 0, 1, 4)
         self.move_result = QLabel("Requested angle and integer-step result will appear here.")
@@ -297,20 +366,39 @@ class AutosamplerWindow(QMainWindow):
             "color: #0d47a1; font-size: 18px; font-weight: bold; padding: 10px; }"
         )
         layout.addWidget(self.home_distance_readout, 4, 0, 1, 4)
+        self.homing_progress_label = QLabel()
+        self.homing_progress_label.setWordWrap(True)
+        layout.addWidget(self.homing_progress_label, 5, 0, 1, 4)
         group = QGroupBox("Guided calibration — operator measurements")
         form = QVBoxLayout(group)
         instructions = QLabel(
             "1. Home the axis, then use small manual jogs only after checking collision-free travel.\n"
             "2. Physically measure and verify the selected value; commanded steps cannot detect stalls.\n"
-            "3. Enter the measurement and confirm it. Repeat for Z, A, B, transfer settings, and each carousel location.\n"
-            "Carousel angles are measured from X home separately for P1 and P2. Add vessels on the Vessels tab first.\n"
+            "3. Enter the measurement and confirm it. Repeat for Z, A, B, transfer settings, and the V24 carousel references.\n"
+            "Calibrate V24 from X home separately for P1 and P2. All other rack angles are derived automatically.\n"
+            "Z home is 0; working positions are negative (e.g. −125 mm). Positive Z distances are converted when recorded; maximum travel is a positive distance.\n"
+            "A/B also work in negative coordinates: contact is negative, maximum travel is a positive distance from home, and µL/step is positive.\n"
             "Recording sends no motion or firmware settings. Speed/acceleration values must match verified firmware settings."
         )
         instructions.setWordWrap(True)
         form.addWidget(instructions)
+        self.read_firmware_button = QPushButton("Read from GRBL")
+        self.read_firmware_button.setToolTip(
+            "Read $$ and update Z/A/B firmware maximum speeds and accelerations. No settings are written to GRBL."
+        )
+        self.read_firmware_button.clicked.connect(
+            lambda: self._submit("read firmware calibration", self.machine.read_firmware_calibration)
+        )
+        form.addWidget(self.read_firmware_button)
+        self.firmware_summary = QLabel()
+        self.firmware_summary.setWordWrap(True)
+        form.addWidget(self.firmware_summary)
         self.measurement_combo = QComboBox()
         self.measurement_combo.currentIndexChanged.connect(self._show_measurement)
         form.addWidget(self.measurement_combo)
+        self.measurement_help = QLabel()
+        self.measurement_help.setWordWrap(True)
+        form.addWidget(self.measurement_help)
         self.measurement_value = QLineEdit()
         self.measurement_value.setPlaceholderText("Enter physically verified measurement in the displayed units")
         form.addWidget(self.measurement_value)
@@ -326,9 +414,181 @@ class AutosamplerWindow(QMainWindow):
         self.calibration_status = QLabel()
         self.calibration_status.setWordWrap(True)
         form.addWidget(self.calibration_status)
-        layout.addWidget(group, 5, 0, 1, 4)
-        layout.setRowStretch(6, 1)
+        self.travel_comparison_button = QPushButton("Record travel comparison using the measurement above")
+        self.travel_comparison_button.setToolTip("Uses the selected jog axis: X physical travel in degrees; Z/A/B in mm. Records a comparison in the operation log without changing calibration settings.")
+        self.travel_comparison_button.clicked.connect(self.record_travel_comparison)
+        form.addWidget(self.travel_comparison_button)
+        self.travel_comparison_result = QLabel("Physical travel comparison: none recorded this session")
+        self.travel_comparison_result.setWordWrap(True)
+        form.addWidget(self.travel_comparison_result)
+        layout.addWidget(self._position_panel(), 6, 0, 1, 4)
+        layout.addWidget(group, 7, 0, 1, 4)
+        layout.addWidget(self._overshoot_panel(), 8, 0, 1, 4)
+        layout.setRowStretch(9, 1)
         return panel
+
+    def _overshoot_panel(self):
+        group = QGroupBox("Automatic carousel overshoot calibration")
+        form = QFormLayout(group)
+        note = QLabel("Positioning only: retracts Z to clearance and moves vials between P1 and P2. "
+                      "Verify that the entire extended angle range is mechanically clear. No liquid or pipette strokes. "
+                      "Reliability requires ≥80% and ≥2 successes at every spot in each direction.")
+        note.setWordWrap(True)
+        form.addRow(note)
+        current = self.machine.config.carousel_overshoot_deg
+        self.overshoot_min = QLineEdit("0")
+        self.overshoot_max = QLineEdit(f"{max(5, current):g}")
+        self.overshoot_step = QLineEdit("1")
+        self.overshoot_secondary_min = QLineEdit("0")
+        self.overshoot_secondary_max = QLineEdit(f"{max(2, self.machine.config.carousel_secondary_overshoot_deg):g}")
+        self.overshoot_secondary_step = QLineEdit("1")
+        self.overshoot_repetitions = QLineEdit("3")
+        vials = [v.location_id for v in self.machine.inventory.vessels.values() if v.vessel_type is VesselType.VIAL_15ML]
+        defaults = (vials[0],) if vials else ("V01",)
+        self.overshoot_spots = QLineEdit(", ".join(defaults))
+        self.overshoot_spots.setToolTip("One vial spot is sufficient. Optionally enter more comma-separated IDs to verify additional positions.")
+        self.overshoot_deadline = QLineEdit("2")
+        self.overshoot_stability_hold = QLineEdit("0.5")
+        self.overshoot_stability_hold.setToolTip(
+            "0 accepts the first fresh balance ST reading after motion. A positive value requires "
+            "continuous ST readings for that duration within the trial deadline. Independent of transfer settings.")
+        self._overshoot_inputs = (self.overshoot_min, self.overshoot_max, self.overshoot_step,
+                                  self.overshoot_secondary_min, self.overshoot_secondary_max, self.overshoot_secondary_step,
+                                  self.overshoot_repetitions, self.overshoot_spots, self.overshoot_deadline,
+                                  self.overshoot_stability_hold)
+        for label, widget in zip(("A primary minimum (°)", "A primary maximum (°)", "A increment (°)",
+                                  "B secondary minimum (°)", "B secondary maximum (°)", "B increment (°)",
+                                  "Trials per spot and direction", "Vial spot ID (additional spots optional, comma separated)",
+                                  "Stabilization deadline (s)", "Stable-reading hold (s; 0 = first fresh stable reading)"), self._overshoot_inputs):
+            form.addRow(label, widget)
+        self.overshoot_start = QPushButton("Start overshoot calibration")
+        self.overshoot_start.clicked.connect(self.start_overshoot_calibration)
+        self.overshoot_stop = QPushButton("Stop calibration (fault hold)")
+        self.overshoot_stop.setToolTip("Immediately requests hold without reset; cancels queued work and requires recovery/Home.")
+        self.overshoot_stop.clicked.connect(self.stop_overshoot_calibration)
+        self.overshoot_recover = QPushButton("Recover GRBL connection after Stop / Abort")
+        self.overshoot_recover.clicked.connect(self.recover_overshoot_connection)
+        self.overshoot_apply = QPushButton("Apply and save recommended A/B pair")
+        self.overshoot_apply.clicked.connect(lambda: self._submit_guarded(
+            "apply overshoot recommendation", self.machine.apply_overshoot_recommendation))
+        for button in (self.overshoot_start, self.overshoot_stop, self.overshoot_recover, self.overshoot_apply):
+            form.addRow(button)
+        self.overshoot_status = QLabel(self.machine.overshoot_progress)
+        self.overshoot_status.setWordWrap(True)
+        form.addRow(self.overshoot_status)
+        self.overshoot_comparison = QPlainTextEdit()
+        self.overshoot_comparison.setReadOnly(True)
+        self.overshoot_comparison.setMaximumHeight(180)
+        form.addRow(self.overshoot_comparison)
+        return group
+
+    def start_overshoot_calibration(self):
+        from autosampler.overshoot_calibration import OvershootOptions
+        try:
+            options = OvershootOptions(tuple(s.strip() for s in self.overshoot_spots.text().split(",") if s.strip()),
+                float(self.overshoot_min.text()), float(self.overshoot_max.text()), float(self.overshoot_step.text()),
+                int(self.overshoot_repetitions.text()), float(self.overshoot_deadline.text()),
+                float(self.overshoot_stability_hold.text()),
+                secondary_minimum_deg=float(self.overshoot_secondary_min.text()),
+                secondary_maximum_deg=float(self.overshoot_secondary_max.text()),
+                secondary_increment_deg=float(self.overshoot_secondary_step.text()))
+            options.candidates()
+            self.machine.overshoot_result = None
+            self.overshoot_comparison.clear()
+            self._submit("overshoot calibration", self.machine.calibrate_carousel_overshoot, options)
+        except Exception as exc:
+            self.show_error("Overshoot calibration", exc)
+
+    def stop_overshoot_calibration(self):
+        self.worker.cancel_pending()
+        try:
+            self.machine.stop_overshoot_calibration()
+        except Exception as exc:
+            self.show_error("Stop overshoot calibration", exc)
+        self._render_state(self.machine.state)
+
+    def recover_overshoot_connection(self):
+        answer = QMessageBox.question(
+            self, "Recover GRBL after Stop / Abort",
+            "This deliberately resets and reconnects GRBL. Reset can release motor holding torque. "
+            "Secure gravity-loaded axes first. No movement will be commanded; Home all axes afterward. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        if answer == QMessageBox.StandardButton.Yes:
+            self._submit_guarded("recover GRBL", self.machine.recover_grbl_connection)
+
+    def _position_panel(self):
+        group = QGroupBox("Controller-reported position and displacement")
+        grid = QGridLayout(group)
+        self.position_coordinate = QComboBox()
+        self.position_coordinate.addItem("Machine coordinates (MPos)", "machine")
+        self.position_coordinate.addItem("Work coordinates (WPos)", "work")
+        self.position_coordinate.currentIndexChanged.connect(lambda: self._render_positions())
+        grid.addWidget(self.position_coordinate, 0, 0, 1, 2)
+        self.position_status = QLabel()
+        self.position_status.setWordWrap(True)
+        grid.addWidget(self.position_status, 0, 2, 1, 3)
+        for col, title in enumerate(("Axis / units", "Current", "Signed Δ from reference", "Homing", "Measurement reference")):
+            grid.addWidget(QLabel(title), 1, col)
+        self.position_rows = {}
+        self.position_reference_buttons = {}
+        for row, axis in enumerate(Axis, 2):
+            unit = "logical steps" if axis is Axis.CAROUSEL else "mm"
+            grid.addWidget(QLabel(f"{axis.value} · {axis.friendly_name} ({unit})"), row, 0)
+            labels = [QLabel() for _ in range(3)]
+            for col, label in enumerate(labels, 1):
+                label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                grid.addWidget(label, row, col)
+            self.position_rows[axis.value] = labels
+            button = QPushButton(f"Set {axis.value} reference")
+            button.clicked.connect(lambda checked=False, a=axis.value: self.set_measurement_reference(a))
+            grid.addWidget(button, row, 4)
+            self.position_reference_buttons[axis.value] = button
+        self.all_references_button = QPushButton("Set all references / repeat measurement")
+        self.all_references_button.clicked.connect(lambda: self.set_measurement_reference())
+        grid.addWidget(self.all_references_button, 6, 0, 1, 5)
+        note = QLabel("GUI references only; no coordinate or work-offset changes. Assumes GRBL $13=0. "
+                      "Reported values do not verify physical travel without independent position feedback. "
+                      "Physical comparison below uses the selected jog axis: X degrees; Z/A/B mm.")
+        note.setWordWrap(True)
+        grid.addWidget(note, 7, 0, 1, 5)
+        return group
+
+    def set_measurement_reference(self, axis=None):
+        self._submit("measurement reference", self.machine.set_measurement_reference,
+                     self.position_coordinate.currentData(), axis)
+
+    def record_travel_comparison(self):
+        try:
+            self._submit("travel comparison", self.machine.record_travel_comparison,
+                         self.position_coordinate.currentData(), self.AXIS_LABELS[self.axis_combo.currentText()].value,
+                         float(self.measurement_value.text()), self.measurement_confirm.isChecked())
+            self.measurement_confirm.setChecked(False)
+        except Exception as exc:
+            self.show_error("Travel comparison", exc)
+
+    def _render_positions(self):
+        if not hasattr(self, "position_rows"):
+            return
+        state = self.machine.state
+        tracking = state.reported_position
+        coordinate = self.position_coordinate.currentData()
+        availability = tracking.availability(state.grbl_connected)
+        values = getattr(tracking, coordinate)
+        self.position_status.setText(f"{availability} · {tracking.controller_state} · "
+                                     f"Homing {'complete' if state.homed else 'incomplete / unhomed'}")
+        self.position_status.setStyleSheet("color: #1b5e20;" if availability == "Live" and state.homed else "color: #e65100;")
+        available = (availability == "Live" and tracking.controller_state == "Idle"
+                     and not state.current_operation and not self._command_inflight)
+        for axis in Axis:
+            current, delta, homing = self.position_rows[axis.value]
+            value = values.get(axis.value)
+            displacement = tracking.displacement(coordinate, axis.value)
+            suffix = " (stale)" if availability == "Stale" else ""
+            current.setText(f"{value:+.3f}{suffix}" if value is not None and availability in ("Live", "Stale") else availability if availability != "Live" else "Unknown")
+            delta.setText(f"{displacement:+.3f}{suffix}" if displacement is not None and availability in ("Live", "Stale") else "—")
+            homing.setText("Homed" if axis.value in state.homed_axes else "UNHOMED")
+            self.position_reference_buttons[axis.value].setEnabled(available and value is not None)
+        self.all_references_button.setEnabled(available and all(a.value in values for a in Axis))
 
     def _refresh_measurements(self):
         specs = measurements(self.machine.inventory.vessels)
@@ -346,8 +606,18 @@ class AutosamplerWindow(QMainWindow):
 
     def _show_measurement(self):
         key = self.measurement_combo.currentData()
+        explanation = aspiration_measurement_help(key)
+        self.measurement_help.setText(explanation)
+        self.measurement_help.setVisible(bool(explanation))
         value = get_value(self.machine.config, key) if key else None
         self.measurement_value.setText("" if value is None else str(value))
+        self.measurement_value.setPlaceholderText(
+            "Signed Z coordinate, e.g. -125 (positive distances are converted)"
+            if key in ("z.safe_position_mm", "z.dispense_position_mm", "aspiration.vial_bottom_mm", "aspiration.beaker_bottom_mm")
+            else "Enter physically verified measurement in the displayed units"
+        )
+        if key in ("pipette_1.contact_position_mm", "pipette_2.contact_position_mm"):
+            self.measurement_value.setPlaceholderText("Signed A/B contact, e.g. -14.8 (positive distances are converted)")
         self.measurement_confirm.setChecked(False)
 
     def _next_measurement(self):
@@ -371,7 +641,8 @@ class AutosamplerWindow(QMainWindow):
         panel.setLayout(layout)
         explanation = QLabel(
             "Configure any of the 24 fixed 15 mL vial positions and two fixed 100 mL beaker positions. "
-            "A row is available to commands only when all four values are entered. Exactly one Wash and one Dump are required."
+            "Input, Output and Wash require all four values. Dump requires only Name and Category; "
+            "its quantity and density are not tracked. Exactly one Wash and one Dump are required."
         )
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
@@ -402,7 +673,9 @@ class AutosamplerWindow(QMainWindow):
             }
             for field in (name, density, quantity):
                 field.textChanged.connect(self._vessel_table_changed)
-            category.currentIndexChanged.connect(self._vessel_table_changed)
+            category.currentIndexChanged.connect(
+                lambda _index, slot=location: self._vessel_category_changed(slot)
+            )
         layout.addWidget(self.vessel_table, 1)
         buttons = QHBoxLayout()
         save, reset = QPushButton("Apply vessel setup"), QPushButton("New Session / Reset")
@@ -423,12 +696,30 @@ class AutosamplerWindow(QMainWindow):
         panel.setLayout(layout)
         group, form = QGroupBox("Operation inputs"), QFormLayout()
         group.setLayout(form)
-        self.operation_fields = {"source": QLineEdit("V01"), "destination": QLineEdit("V02"), "amount": QLineEdit("100")}
+        self.operation_fields = {"source": QComboBox(), "destination": QComboBox(), "amount": QLineEdit("100")}
+        for role in ("source", "destination"):
+            self.operation_fields[role].setEditable(False)
+            self.operation_fields[role].setPlaceholderText("No fully configured vessels available")
         self.pipette_combo = QComboBox()
         self.pipette_combo.addItems(("P1", "P2"))
         form.addRow("Source location", self.operation_fields["source"])
         form.addRow("Destination location", self.operation_fields["destination"])
         form.addRow("Amount µL", self.operation_fields["amount"])
+        default_buffer = self.machine.config.transfer.default_draw_buffer_percent
+        self.operation_fields["buffer_percent"] = QLineEdit("" if default_buffer is None else f"{default_buffer:g}")
+        self._draw_buffer_default = default_buffer
+        self._draw_buffer_overridden = False
+        self.operation_fields["buffer_percent"].textEdited.connect(self._draw_buffer_edited)
+        self.operation_fields["buffer_percent"].setToolTip(
+            "Override the calibrated draw buffer for Draw and Transfer. The saved default is unchanged. "
+            "Cleaning uses zero buffer."
+        )
+        buffer_row = QHBoxLayout()
+        buffer_row.addWidget(self.operation_fields["buffer_percent"])
+        self.use_default_buffer_button = QPushButton("Use default")
+        self.use_default_buffer_button.clicked.connect(self._use_default_draw_buffer)
+        buffer_row.addWidget(self.use_default_buffer_button)
+        form.addRow("Draw buffer (%)", buffer_row)
         form.addRow("Pipette", self.pipette_combo)
         layout.addWidget(group)
         self.operation_status = QLabel()
@@ -443,26 +734,186 @@ class AutosamplerWindow(QMainWindow):
             buttons.addWidget(button, index // 3, index % 3)
         layout.addLayout(buttons)
         layout.addStretch()
+        for role in ("source", "destination"):
+            self.operation_fields[role].currentIndexChanged.connect(lambda _index: self._render_state(self.machine.state))
+        self.pipette_combo.currentIndexChanged.connect(lambda _index: self._render_state(self.machine.state))
+        for field in ("amount", "buffer_percent"):
+            self.operation_fields[field].textChanged.connect(self._update_operation_tooltips)
         return panel
+
+    def _update_operation_tooltips(self, *_):
+        source = self._selected_operation_location("source") or "the selected source"
+        destination = self._selected_operation_location("destination") or "the selected destination"
+        pipette = self.pipette_combo.currentText()
+        def special(category, fallback):
+            matches = self.machine.inventory.by_category(category)
+            return matches[0].location_id if len(matches) == 1 else fallback
+        wash = special(VesselCategory.CLEANING, "the Wash vessel")
+        dump = special(VesselCategory.WASTE, "the Dump vessel")
+        amount = "the entered amount"
+        buffer = "the entered buffer"
+        target = ""
+        try:
+            volume = self._amount()
+            if math.isfinite(volume) and volume > 0:
+                amount = f"{volume:g} µL"
+            percent = self._draw_buffer()
+            buffer = f"{percent:g}% buffer"
+            if math.isfinite(volume) and volume > 0 and math.isfinite(volume * (1 + percent / 100)):
+                target = f" (target {volume * (1 + percent / 100):g} µL)"
+        except (ValueError, OverflowError):
+            pass
+        cfg = self.machine._pipette_config(self._pipette())
+        tips = [
+            f"Raise Z to carousel clearance, then align {source} under {pipette}. "
+            + (f"A={self.machine.config.carousel_overshoot_deg:g}° beyond the target in the travel direction; "
+               f"reverse past the target by B={self.machine.config.carousel_secondary_overshoot_deg:g}°, then return exactly. Wait at every stage. "
+               if self.machine.config.carousel_overshoot_deg or self.machine.config.carousel_secondary_overshoot_deg else "")
+            + (f"Then allow up to X={self.machine.config.carousel_stability_timeout_s:g}s for a fresh stable scale reading; "
+               f"on timeout, jostle once by Y={self.machine.config.carousel_jostle_deg:g}° opposite the last segment and return. "
+               "An unavailable scale skips this step with a warning in the operation log. "
+               if self.machine.config.carousel_stability_timeout_s > 0 else "")
+            + "Leaves Z at clearance; no liquid movement.",
+            f"Draw {amount} plus {buffer}{target} from {source} into {pipette}, using scale feedback; then retract Z. Destination is unused.",
+            f"Dispense {amount} from liquid already in {pipette} into {destination}, then empty any remainder into {dump}. Source and buffer are unused.",
+            f"Empty {pipette} into {dump} using two full emptying strokes, then retract Z. Source, destination, amount and buffer are unused.",
+            f"Wash {pipette} at {wash} for {self.machine.config.transfer.default_cleaning_cycles} cycles of {cfg.max_volume_ul:g} µL; return liquid to Wash with zero buffer. Other inputs are unused.",
+            f"Transfer {amount} from {source} to {destination} using {buffer} on each draw; dump remainders into {dump}. Pipette and cycle count are planned automatically; the pipette selector is unused.",
+        ]
+        blockers = getattr(self, "_positioning_tooltip_blockers", [])
+        if blockers:
+            tips[0] += "\nCurrently locked: " + "; ".join(blockers)
+        for button, tip in zip(self.operation_buttons, tips):
+            if button.toolTip() != tip:
+                button.setToolTip(tip)
+
+    @staticmethod
+    def _apply_control_availability(availability):
+        """Apply final states only; stable refreshes must not interrupt a press."""
+        for widget, enabled in availability:
+            if widget.isEnabled() != enabled:
+                widget.setEnabled(enabled)
+
+    def _selected_operation_location(self, role):
+        return self.operation_fields[role].currentData() or ""
+
+    def _refresh_operation_vessels(self):
+        eligible = []
+        for vessel in sorted(self.machine.inventory.vessels.values(), key=lambda v: v.number):
+            location = vessel.location_id
+            if location not in self.vessel_rows or self._missing_vessel_fields(location):
+                continue
+            row = self.vessel_rows[location]
+            if row["category"].currentText() != "dump":
+                try:
+                    density, quantity = float(row["density"].text()), float(row["quantity"].text())
+                    if not math.isfinite(density) or not math.isfinite(quantity) or density <= 0 or not 0 <= quantity <= vessel.capacity_ul:
+                        continue
+                except ValueError:
+                    continue
+            eligible.append(vessel)
+        for role in ("source", "destination"):
+            combo = self.operation_fields[role]
+            choices = [
+                (f"{v.location_id} — {v.name}", v.location_id) for v in eligible
+                if role != "source" or v.category is not VesselCategory.WASTE
+            ]
+            if choices == [(combo.itemText(i), combo.itemData(i)) for i in range(combo.count())]:
+                continue
+            selected = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            for label, location in choices:
+                combo.addItem(label, location)
+            index = combo.findData(selected)
+            if index < 0 and choices:
+                index = 0
+                if role == "destination":
+                    index = next((i for i, (_, location) in enumerate(choices) if location != self._selected_operation_location("source")), 0)
+            combo.setCurrentIndex(index)
+            combo.blockSignals(False)
 
     @Slot()
     def refresh_devices(self):
         if self.mock_mode:
             self.serial_devices = []
+            self.device_source.setEnabled(False)
+            self.glovebox_target.setEnabled(False)
             for combo, text in ((self.grbl_devices, "Mock GRBL"), (self.scale_devices, "Mock scale")):
                 combo.clear(); combo.addItem(text, None); combo.setEnabled(False)
             return
+        self.glovebox_target.setEnabled(self._remote_mode())
+        if self._remote_mode():
+            self.serial_devices = []
+            self._populate_devices()
+            self.remote_discovery.start("refresh", self.glovebox_target.text())
+            return
         self.serial_devices = discover_serial_devices()
+        self._populate_devices()
+
+    def _remote_mode(self) -> bool:
+        return self.device_source.currentIndex() == 1
+
+    def _preference_role(self, role: DeviceRole) -> DeviceRole:
+        if not self._remote_mode():
+            return role
+        return DeviceRole.GRBL_REMOTE if role is DeviceRole.GRBL else DeviceRole.SCALE_REMOTE
+
+    def _populate_devices(self):
         for role, combo in ((DeviceRole.GRBL, self.grbl_devices), (DeviceRole.SCALE, self.scale_devices)):
             combo.setEnabled(True)
             combo.clear(); combo.addItem("Select a serial device…", None)
             for device in self.serial_devices:
                 combo.addItem(device.display_name, device)
-            resolution = resolve_identity(self.device_preferences.identity(role), self.serial_devices)
+            identity = self.device_preferences.identity(self._preference_role(role))
+            resolution = resolve_identity(identity, self.serial_devices)
             combo.setCurrentIndex(0)
             if resolution.confident and resolution.selected:
                 index = next((i for i in range(combo.count()) if combo.itemData(i) == resolution.selected), 0)
                 combo.setCurrentIndex(index)
+            elif (
+                role is DeviceRole.GRBL
+                and len(self.serial_devices) == 1
+                and (identity is None or (identity.serial_number is None and identity.vid is None))
+            ):
+                # Make a lone port visible on first setup. Connecting remains
+                # an explicit operator action, and Scale is never inferred.
+                combo.setCurrentIndex(1)
+
+    def _probe_glovebox(self):
+        if not self._remote_mode():
+            self.remote_discovery.start("probe", self.glovebox_target.text())
+
+    @Slot(str, str, object)
+    def _remote_discovery_completed(self, purpose, target, devices):
+        if self._closing:
+            return
+        if purpose == "refresh":
+            if self._remote_mode() and target == self.glovebox_target.text():
+                self.serial_devices = devices
+                self._populate_devices()
+            return
+        if purpose == "probe" and not self._remote_mode() and not (
+            self.machine.state.grbl_connected or self.machine.state.scale_connected
+        ):
+            answer = QMessageBox.question(
+                self, "Glovebox Pi found",
+                f"The glovebox Pi is reachable and reports {len(devices)} serial device(s). "
+                "Use its USB devices for GRBL and the scale?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self.device_source.setCurrentIndex(1)
+
+    @Slot(str, str, object)
+    def _remote_discovery_failed(self, purpose, target, error):
+        if self._closing:
+            return
+        if purpose == "probe":
+            logging.getLogger(__name__).info("Glovebox Pi not available: %s", error)
+        elif self._remote_mode() and target == self.glovebox_target.text():
+            self.show_error("Glovebox discovery", error)
 
     @staticmethod
     def _selected_device(combo, role):
@@ -477,14 +928,17 @@ class AutosamplerWindow(QMainWindow):
     @Slot()
     def _monitor_device_presence(self):
         devices = discover_serial_devices()
-        if self.machine.state.grbl_connected and not device_is_present(self.machine.config.grbl.port, devices):
+        if (self.machine.state.grbl_connected and not str(self.machine.config.grbl.port).startswith("ssh://")
+                and not device_is_present(self.machine.config.grbl.port, devices)):
             self.machine.notify_grbl_disconnected()
-        if self.machine.state.scale_connected and not device_is_present(self.machine.config.scale.port, devices):
+        if (self.machine.state.scale_connected and not str(self.machine.config.scale.port).startswith("ssh://")
+                and not device_is_present(self.machine.config.scale.port, devices)):
             self.machine.notify_scale_disconnected()
 
     @Slot()
     def _poll_limit_status(self):
-        if not self.machine.state.grbl_connected or self._limit_poll_pending:
+        if (not self.machine.state.grbl_connected or self._limit_poll_pending
+                or self._command_inflight or self.worker.busy or self.machine.state.current_operation):
             return
         self._limit_poll_pending = True
         self._submit("limit status", self.machine.refresh_grbl_status)
@@ -494,8 +948,10 @@ class AutosamplerWindow(QMainWindow):
         try:
             if not self.mock_mode:
                 device = self._selected_device(self.grbl_devices, "GRBL")
+                if self._remote_mode() and not device.device.startswith("ssh://"):
+                    raise ValueError("Select a discovered GRBL device on the glovebox Pi.")
                 self.machine.config.grbl.port = device.device
-                self.device_preferences.associate(DeviceRole.GRBL, device)
+                self.device_preferences.associate(self._preference_role(DeviceRole.GRBL), device)
             self._submit("connect GRBL", self.machine.connect_grbl)
         except Exception as exc: self.show_error("GRBL selection", exc)
 
@@ -504,8 +960,10 @@ class AutosamplerWindow(QMainWindow):
         try:
             if not self.mock_mode:
                 device = self._selected_device(self.scale_devices, "scale")
+                if self._remote_mode() and not device.device.startswith("ssh://"):
+                    raise ValueError("Select a discovered scale device on the glovebox Pi.")
                 self.machine.config.scale.port = device.device
-                self.device_preferences.associate(DeviceRole.SCALE, device)
+                self.device_preferences.associate(self._preference_role(DeviceRole.SCALE), device)
             self._submit("connect scale", self.machine.connect_scale)
         except Exception as exc: self.show_error("Scale selection", exc)
 
@@ -525,6 +983,7 @@ class AutosamplerWindow(QMainWindow):
 
     @Slot()
     def abort(self):
+        self.worker.cancel_pending()
         try: self.machine.abort()  # bypass FIFO so Abort is never queued
         except Exception as exc: self.show_error("Abort", exc)
         self._render_state(self.machine.state)
@@ -536,6 +995,9 @@ class AutosamplerWindow(QMainWindow):
 
     @Slot(bool)
     def toggle_calibration_unlock(self, enabled):
+        if self._command_inflight or self.machine.state.current_operation or self.machine.grbl.recovery_required:
+            self._set_unlock_checkbox(self.machine.state.calibration_unlocked)
+            return
         if enabled:
             answer = QMessageBox.warning(
                 self,
@@ -589,8 +1051,19 @@ class AutosamplerWindow(QMainWindow):
 
     def jog(self, amount): self.move_amount.setText(str(amount)); self.move_axis()
 
+    def _vessel_category_changed(self, location):
+        row = self.vessel_rows[location]
+        category = row["category"].currentText()
+        name = row["name"]
+        if category in ("wash", "dump") and name.text().strip().lower() in ("", "wash", "dump"):
+            name.blockSignals(True)
+            name.setText(category.title())
+            name.blockSignals(False)
+        self._vessel_table_changed()
+
     def _vessel_table_changed(self, *_):
         self._vessel_table_dirty = True
+        self._update_dump_fields()
         self._update_vessel_status()
         if hasattr(self, "operation_buttons"):
             self._render_state(self.machine.state)
@@ -603,7 +1076,22 @@ class AutosamplerWindow(QMainWindow):
             "density": row["density"].text().strip(),
             "initial quantity": row["quantity"].text().strip(),
         }
+        if values["category"] == "dump":
+            values.pop("density")
+            values.pop("initial quantity")
         return [label for label, value in values.items() if not value]
+
+    def _update_dump_fields(self):
+        for row in self.vessel_rows.values():
+            dump = row["category"].currentText() == "dump"
+            for key in ("density", "quantity"):
+                field = row[key]
+                field.setEnabled(not dump)
+                field.setToolTip("Not tracked for mixed waste" if dump else "")
+                if dump:
+                    field.blockSignals(True)
+                    field.clear()
+                    field.blockSignals(False)
 
     def _vessels_from_table(self):
         vessels = []
@@ -612,10 +1100,11 @@ class AutosamplerWindow(QMainWindow):
                 continue
             row = self.vessel_rows[location]
             vessel_type = VesselType.VIAL_15ML if location.startswith("V") else VesselType.BEAKER_100ML
+            dump = row["category"].currentText() == "dump"
             vessel = Vessel(
                 location, number, row["name"].text().strip(),
                 self.UI_CATEGORIES[row["category"].currentText()], vessel_type,
-                float(row["quantity"].text()), float(row["density"].text()),
+                None if dump else float(row["quantity"].text()), None if dump else float(row["density"].text()),
                 row["name"].text().strip(),
             )
             vessel.validate()
@@ -636,6 +1125,11 @@ class AutosamplerWindow(QMainWindow):
 
     def refresh_vessels(self):
         self._refresh_measurements()
+        if self._vessel_table_dirty:
+            # Treat the table as an editing draft until Apply or explicit Reset.
+            # Polling and unrelated command completions must never reload over it.
+            self._update_vessel_status()
+            return
         category_labels = {
             VesselCategory.INPUT: "input", VesselCategory.OUTPUT: "output",
             VesselCategory.CLEANING: "wash", VesselCategory.WASTE: "dump",
@@ -650,10 +1144,11 @@ class AutosamplerWindow(QMainWindow):
                 widget.blockSignals(True)
             row["name"].setText(vessel.name)
             row["category"].setCurrentText(category_labels[vessel.category])
-            row["density"].setText(f"{vessel.density_g_ml:g}")
-            row["quantity"].setText(f"{vessel.quantity_ul:g}")
+            row["density"].setText("" if vessel.density_g_ml is None else f"{vessel.density_g_ml:g}")
+            row["quantity"].setText("" if vessel.quantity_ul is None else f"{vessel.quantity_ul:g}")
             for widget in widgets:
                 widget.blockSignals(False)
+        self._update_dump_fields()
         self._update_vessel_status()
 
     def _clear_vessel_table(self):
@@ -667,6 +1162,8 @@ class AutosamplerWindow(QMainWindow):
             row["quantity"].clear()
             for widget in widgets:
                 widget.blockSignals(False)
+
+        self._update_dump_fields()
 
     def _vessel_setup_issue(self):
         assigned = {"wash": [], "dump": []}
@@ -749,21 +1246,38 @@ class AutosamplerWindow(QMainWindow):
     def _pipette(self): return PipetteId(self.pipette_combo.currentText())
     def _amount(self): return float(self.operation_fields["amount"].text())
 
+    def _draw_buffer_edited(self, _text):
+        self._draw_buffer_overridden = True
+
+    def _use_default_draw_buffer(self):
+        self._draw_buffer_overridden = False
+        self._draw_buffer_default = self.machine.config.transfer.default_draw_buffer_percent
+        value = self._draw_buffer_default
+        self.operation_fields["buffer_percent"].setText("" if value is None else f"{value:g}")
+
+    def _draw_buffer(self):
+        value = float(self.operation_fields["buffer_percent"].text())
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("Draw buffer must be a finite, non-negative percentage.")
+        return value
+
     def go_to_source(self):
         try:
-            source, = self._require_command_ready(self.operation_fields["source"].text())
+            source = self._require_configured_slot(self._selected_operation_location("source"))
+            if self._vessel_table_dirty:
+                raise ValueError("Apply the vessel setup before positioning.")
             self._submit_guarded("go to spot", self.machine.go_to_spot, source, self._pipette())
         except Exception as exc: self.show_error("Go to source", exc)
 
     def draw(self):
         try:
-            source, = self._require_command_ready(self.operation_fields["source"].text())
-            self._submit_guarded("draw", self.machine.draw, source, self._amount(), self._pipette())
+            source, = self._require_command_ready(self._selected_operation_location("source"))
+            self._submit_guarded("draw", self.machine.draw, source, self._amount(), self._pipette(), self._draw_buffer())
         except Exception as exc: self.show_error("Draw", exc)
 
     def dispense(self):
         try:
-            destination, = self._require_command_ready(self.operation_fields["destination"].text())
+            destination, = self._require_command_ready(self._selected_operation_location("destination"))
             self._submit_guarded("dispense", self.machine.dispense, destination, self._amount(), self._pipette())
         except Exception as exc: self.show_error("Dispense", exc)
 
@@ -783,8 +1297,9 @@ class AutosamplerWindow(QMainWindow):
     def transfer(self):
         try:
             source, destination = self._require_command_ready(
-                self.operation_fields["source"].text(), self.operation_fields["destination"].text()
+                self._selected_operation_location("source"), self._selected_operation_location("destination")
             )
+            buffer_percent = self._draw_buffer()
             amount, plan = self._amount(), self.machine.plan_transfer(self._amount())
             confirmed, prefer_p1 = True, None
             if plan.requires_confirmation:
@@ -794,19 +1309,95 @@ class AutosamplerWindow(QMainWindow):
                 if not confirmed and amount < self.machine.config.transfer.p1_multi_threshold_ul:
                     prefer_p1, confirmed = False, True
             if confirmed:
-                self._submit("transfer", self.machine.transfer, source, destination, amount, True, prefer_p1)
+                self._submit("transfer", self.machine.transfer, source, destination, amount, True, prefer_p1, buffer_percent)
         except Exception as exc: self.show_error("Transfer error", exc)
 
     def _submit_guarded(self, name, function, *args):
         try: self._submit(name, function, *args)
         except Exception as exc: self.show_error(name.title(), exc)
 
-    def _submit(self, name, function, *args): self.worker.submit(name, function, *args)
+    def _submit(self, name, function, *args):
+        if self._command_inflight or self.machine.state.current_operation:
+            if name == "limit status":
+                self._limit_poll_pending = False
+            else:
+                logging.getLogger(__name__).warning("%s ignored: a machine command is already pending or running.", name)
+            return False
+        if name != "limit status":
+            self._command_inflight = name
+        generation = self.machine._abort_generation
+        def execute():
+            if generation != self.machine._abort_generation:
+                raise OperationAborted("Request cancelled by Abort/disconnection before execution.")
+            if function == self.machine.home:
+                return function(*args, abort_generation=generation)
+            if function == self.machine.unlock_for_calibration:
+                return function(abort_generation=generation)
+            return function(*args)
+        try:
+            self.worker.submit(name, execute)
+        except Exception:
+            if name != "limit status":
+                self._command_inflight = None
+            raise
+        self._render_state(self.machine.state)
+        return True
+
+    def _render_manual_controls(self):
+        state = self.machine.state
+        available = (state.grbl_connected and self.machine.grbl.connected
+                     and not state.abort_requested and not state.current_operation
+                     and not self._command_inflight and not self.machine.grbl.recovery_required
+                     and not self._manual_command_pending)
+        self.manual_command_input.setEnabled(available)
+        self.manual_send_button.setEnabled(available and bool(self.manual_command_input.text().strip()))
+
+    @Slot()
+    def send_manual_command(self):
+        self._render_manual_controls()
+        if not self.manual_send_button.isEnabled():
+            return
+        command = self.manual_command_input.text()
+        generation = self.machine._abort_generation
+        self._manual_command_pending = True
+        try:
+            self._submit(
+                "manual command", self.machine.send_manual_command, command,
+                None,
+                generation,
+            )
+            self.manual_command_input.clear()
+        except Exception as exc:
+            self._manual_command_pending = False
+            logging.getLogger(__name__).error("Manual command: %s: %s", type(exc).__name__, exc)
+        self._render_manual_controls()
 
     @Slot(str, object)
     def _command_completed(self, name, result):
+        if self._command_inflight == name:
+            self._command_inflight = None
+        if name == "record calibration":
+            self._show_measurement()  # show the signed coordinate actually saved
+        if name == "overshoot calibration":
+            recommendation = (f"Recommended: A={result.recommendation_deg:g}°, B={result.recommendation_secondary_deg:g}° — review, then Apply and save."
+                              if result.recommendation_pair is not None else "No reliable A/B pair found; nothing saved.")
+            rows = [recommendation, "A | B | successes | median seconds | std dev | reliable across all groups"]
+            rows.extend(f"{s.angle_deg:g}° | {s.secondary_deg:g}° | {s.successes}/{s.total} | {s.median_s:.3f} | {s.spread_s:.3f} | {'yes' if s.reliable else 'no'}"
+                        for s in result.candidates)
+            self.overshoot_comparison.setPlainText("\n".join(rows))
+        if name == "apply overshoot recommendation":
+            self.overshoot_comparison.appendPlainText(f"Applied and saved A={result[0]:g}°, B={result[1]:g}°.")
+        if name == "travel comparison":
+            self.travel_comparison_result.setText(
+                f"Recorded {result['axis']} ({result['coordinate']}): controller-reported Δ {result['reported_displacement']:+.3f} {result['unit']}; "
+                f"physically measured {result['physical_distance']:+.3f} {result['unit']}")
+        if name == "manual command":
+            self._manual_command_pending = False
+            self._render_manual_controls()
+            self.manual_command_input.setFocus()
         if name == "limit status":
             self._limit_poll_pending = False
+            return  # status polling does not change vessel data
         if name == "calibration unlock":
             self._unlock_pending = False
             self.calibration_unlock.setEnabled(True)
@@ -816,6 +1407,14 @@ class AutosamplerWindow(QMainWindow):
 
     @Slot(str, object)
     def _command_failed(self, name, error):
+        if self._command_inflight == name:
+            self._command_inflight = None
+        if name == "overshoot calibration":
+            self.overshoot_comparison.setPlainText(f"Calibration stopped: {error}. Previous overshoot restored; nothing saved.")
+        if name == "manual command":
+            self._manual_command_pending = False
+            self._render_manual_controls()
+            return
         if name == "limit status":
             self._limit_poll_pending = False
             logging.getLogger(__name__).warning("Could not refresh GRBL limit state: %s", error)
@@ -824,19 +1423,115 @@ class AutosamplerWindow(QMainWindow):
             self._unlock_pending = False
             self.calibration_unlock.setEnabled(True)
             self._set_unlock_checkbox(False)
+        if isinstance(error, OperationAborted):
+            logging.getLogger(__name__).warning("%s: %s", name, error)
+            return
         self.show_error(name.title(), error)
 
     @Slot(object)
     def _render_state(self, state):
+        self._refresh_operation_vessels()
+        if self.machine.config.transfer.default_draw_buffer_percent != self._draw_buffer_default:
+            if not self._draw_buffer_overridden:
+                self._use_default_draw_buffer()
+            else:
+                self._draw_buffer_default = self.machine.config.transfer.default_draw_buffer_percent
+        self.read_firmware_button.setEnabled(state.grbl_connected and not state.current_operation)
+        def firmware_value(value):
+            return "not read" if value is None else f"{value:g}"
+        self.firmware_summary.setText("Firmware maximum speed (mm/min) / acceleration (mm/s²): " + " | ".join(
+            f"{axis}: {firmware_value(speed)} / {firmware_value(acceleration)}"
+            for axis, speed, acceleration in (
+                ("Z", self.machine.config.z.motion_speed_mm_min, self.machine.config.z.acceleration_mm_s2),
+                ("A", self.machine.config.pipette_1.speed_mm_min, self.machine.config.pipette_1.acceleration_mm_s2),
+                ("B", self.machine.config.pipette_2.speed_mm_min, self.machine.config.pipette_2.acceleration_mm_s2),
+            )
+        ))
+        self._render_positions()
+        self._render_manual_controls()
+        busy = bool(self._command_inflight or state.current_operation)
+        recovery_hint = ""
+        if not busy:
+            if self.machine.grbl.recovery_required:
+                recovery_hint = "\nTo restart: Recover GRBL connection below, then Home all axes using the Home control."
+            elif not state.position_trusted or state.abort_requested:
+                recovery_hint = "\nTo start: connect GRBL if needed, then Home all axes using the Home control."
+            elif not self.machine.scale.connected:
+                recovery_hint = "\nConnect the scale before starting."
+        self.overshoot_status.setText(self.machine.overshoot_progress + recovery_hint)
+        overshoot_active = self._command_inflight == "overshoot calibration" or self.machine._overshoot_running
+        self.overshoot_stop.setEnabled(overshoot_active and not state.abort_requested)
+        self.overshoot_recover.setEnabled(not busy and (self.machine.grbl.recovery_required or state.abort_requested))
+        self.overshoot_start.setEnabled(not busy and state.position_trusted and self.machine.grbl.connected
+                                        and self.machine.scale.connected and not self.machine.grbl.recovery_required
+                                        and not state.abort_requested)
+        for widget in self._overshoot_inputs:
+            widget.setEnabled(not busy)
+        result = self.machine.overshoot_result
+        self.overshoot_apply.setEnabled(not busy and result is not None and result.recommendation_deg is not None)
+        recovery = self.machine.grbl.recovery_required
+        connected = state.grbl_connected
+        self.home_button.setEnabled(connected and not busy and not recovery)
+        self.home_axis.setEnabled(not busy)
+        self.calibration_unlock.setEnabled(connected and not busy and not recovery and not self._unlock_pending)
+        self.grbl_connection_button.setEnabled(not busy)
+        self.scale_connection_button.setEnabled(not busy)
+        can_jog = (connected and not busy and not recovery and not state.abort_requested
+                   and (state.calibration_unlocked or self.AXIS_LABELS[self.axis_combo.currentText()].value in state.homed_axes))
+        for button in (self.move_button, *self.jog_buttons):
+            button.setEnabled(can_jog)
+        self.homing_progress_label.setVisible(bool(state.homing_progress) or recovery)
+        progress = state.homing_progress or ""
+        if state.homing_axis_started_at is not None:
+            elapsed = int(time.monotonic() - state.homing_axis_started_at)
+            timeout = getattr(self.machine.grbl, "HOMING_RESPONSE_TIMEOUT_S", 300)
+            progress += f" · {elapsed}s elapsed (up to {timeout:g}s per cycle). Abort cancels homing."
+        elif recovery:
+            progress += (" Commands blocked; diagnostic status remains available. Motion stop / holding torque unconfirmed. "
+                         "Secure gravity-loaded axes before Abort/reset or disconnect/reconnect; Home is required afterward.")
+        self.homing_progress_label.setText(progress)
+        self.homing_progress_label.setStyleSheet("color: #b71c1c;" if recovery else "color: #0d47a1;")
+        self.connection_homing_progress.setText(progress)
+        self.connection_homing_progress.setVisible(bool(state.homing_progress) or recovery)
+        self.connection_homing_progress.setStyleSheet(self.homing_progress_label.styleSheet())
         self.grbl_connection_button.setText("Disconnect GRBL" if state.grbl_connected else "Connect GRBL")
         self.scale_connection_button.setText("Disconnect Scale" if state.scale_connected else "Connect Scale")
         self.grbl_devices.setEnabled(not state.grbl_connected and not self.mock_mode)
         self.scale_devices.setEnabled(not state.scale_connected and not self.mock_mode)
+        can_change_source = not self.mock_mode and not state.grbl_connected and not state.scale_connected
+        self.device_source.setEnabled(can_change_source)
+        self.glovebox_target.setEnabled(can_change_source and self._remote_mode())
         issues = self.machine.calibration_issues()
         vessel_issue = self._vessel_setup_issue()
-        ready = not issues and not vessel_issue and state.homed and state.position_trusted and state.grbl_connected and not state.abort_requested and not state.current_operation
-        for button in self.operation_buttons:
-            button.setEnabled(ready)
+        ready = not issues and not vessel_issue and state.homed and state.position_trusted and state.grbl_connected and not state.abort_requested and not busy and not recovery
+        source = self._selected_operation_location("source")
+        positioning_issues = self.machine.positioning_issues(source, self._pipette())
+        source_complete = source in self.vessel_rows and not self._missing_vessel_fields(source)
+        positioning_blockers = list(positioning_issues)
+        if source not in self.vessel_rows:
+            positioning_blockers.append("Select a physical source location: V01–V24, B1 or B2")
+        elif not source_complete:
+            positioning_blockers.append(f"Complete {source}: {', '.join(self._missing_vessel_fields(source))}")
+        if self._vessel_table_dirty:
+            positioning_blockers.append("Apply vessel setup")
+        if not state.grbl_connected or not self.machine.grbl.connected:
+            positioning_blockers.append("Connect GRBL")
+        if not state.homed or not state.position_trusted or state.abort_requested:
+            positioning_blockers.append("Home all axes to establish trusted positions")
+        if busy:
+            positioning_blockers.append("Wait for the pending/running command to finish")
+        if recovery:
+            positioning_blockers.append("Resolve the GRBL recovery-required state")
+        can_position = not positioning_blockers
+        # Calculate every final action state before touching any control. In
+        # particular, positioning is independently available during calibration;
+        # applying a blanket liquid lock first would cancel an in-progress press.
+        availability = [(self.operation_buttons[0], can_position)] + [
+            (button, ready) for button in self.operation_buttons[1:]
+        ]
+        self._apply_control_availability(availability)
+        self._positioning_tooltip_blockers = positioning_blockers
+        self._update_operation_tooltips()
         if vessel_issue:
             command_status = vessel_issue
         elif issues:
@@ -845,12 +1540,20 @@ class AutosamplerWindow(QMainWindow):
             command_status = "Connect GRBL and Home all axes before running programmed commands."
         else:
             command_status = "Programmed commands ready."
-        self.operation_status.setText(command_status)
-        self.operation_status.setStyleSheet(
+        if can_position and not ready:
+            command_status = "Go to source is available for positioning tests (Z stays at clearance). Liquid commands: " + command_status
+        elif not can_position:
+            command_status = "Go to source locked: " + "; ".join(positioning_blockers) + ". Liquid commands: " + command_status
+        if self.operation_status.text() != command_status:
+            self.operation_status.setText(command_status)
+        status_style = (
             "QLabel { color: #1b5e20; font-weight: bold; }" if ready
             else "QLabel { color: #b71c1c; font-weight: bold; }"
         )
-        self.record_measurement_button.setEnabled(not state.current_operation)
+        if self.operation_status.styleSheet() != status_style:
+            self.operation_status.setStyleSheet(status_style)
+        self.record_measurement_button.setEnabled(not busy)
+        self.travel_comparison_button.setEnabled(not busy and not recovery)
         self.calibration_status.setText(
             "Automated operations LOCKED — required: " + "; ".join(issues)
             if issues else "Calibration complete. Home all axes before automated operation." if not ready

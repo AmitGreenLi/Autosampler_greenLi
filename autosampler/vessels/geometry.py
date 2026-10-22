@@ -24,6 +24,21 @@ class CylinderGeometry(VesselGeometry):
 
 
 @dataclass(frozen=True)
+class ReservedCylinderGeometry(CylinderGeometry):
+    """Cylinder above a measured volume datum; no model of the volume below it."""
+
+    reserve_ul: float = 0.0
+
+    def liquid_height_mm(self, volume_ul: float) -> float:
+        _validate_volume(volume_ul, self.capacity_ul)
+        if self.reserve_ul < 0 or self.reserve_ul >= self.capacity_ul:
+            raise ValidationError("Invalid reserve volume.")
+        if volume_ul < self.reserve_ul:
+            raise ValidationError("Liquid is below the calibrated vial height reference.")
+        return super().liquid_height_mm(volume_ul - self.reserve_ul)
+
+
+@dataclass(frozen=True)
 class ConicalTubeGeometry(VesselGeometry):
     top_internal_diameter_mm: float = 14.66
     cone_height_mm: float = 22.48

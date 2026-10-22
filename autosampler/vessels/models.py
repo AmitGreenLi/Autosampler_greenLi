@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from enum import Enum
+import math
 
 from autosampler.errors import ValidationError
 
@@ -29,15 +30,27 @@ class Vessel:
     name: str
     category: VesselCategory
     vessel_type: VesselType
-    quantity_ul: float = 0.0
-    density_g_ml: float = 1.0
+    quantity_ul: float | None = 0.0
+    density_g_ml: float | None = 1.0
     material_name: str = "Water"
+
+    def __post_init__(self):
+        if self.category is VesselCategory.WASTE:
+            self.quantity_ul = None
+            self.density_g_ml = None
+            self.material_name = ""
 
     @property
     def capacity_ul(self) -> float:
         return self.vessel_type.capacity_ul
 
     def validate(self) -> None:
+        if self.category is VesselCategory.WASTE:
+            return
+        if self.quantity_ul is None or self.density_g_ml is None:
+            raise ValidationError(f"{self.name} requires quantity and density.")
+        if not math.isfinite(self.quantity_ul) or not math.isfinite(self.density_g_ml):
+            raise ValidationError(f"{self.name} quantity and density must be finite.")
         if self.quantity_ul < 0:
             raise ValidationError(f"{self.name} cannot have a negative quantity.")
         if self.quantity_ul > self.capacity_ul + 1e-9:

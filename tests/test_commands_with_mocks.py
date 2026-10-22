@@ -50,7 +50,7 @@ def test_dispense_updates_destination_and_always_dumps_remainder(configured_mach
     configured_machine.state.pipette_contents_ul["P1"] = 120
     configured_machine.dispense("dest", 100, PipetteId.P1)
     assert configured_machine.inventory.get("dest").quantity_ul == 100
-    assert configured_machine.inventory.get("waste").quantity_ul == 20
+    assert configured_machine.inventory.get("waste").quantity_ul is None
     assert configured_machine.state.pipette_contents_ul["P1"] == 0
     assert configured_machine.state.vessel_under_pipette == "waste"
 
@@ -59,7 +59,7 @@ def test_clean_returns_liquid_to_cleaning_not_waste(configured_machine):
     configured_machine.scale.queue(ScaleReading(50.0, True), ScaleReading(49.8, True))
     configured_machine.clean(PipetteId.P1, cycles=1)
     assert configured_machine.inventory.get("clean").quantity_ul == pytest.approx(50_000)
-    assert configured_machine.inventory.get("waste").quantity_ul == 0
+    assert configured_machine.inventory.get("waste").quantity_ul is None
 
 
 def test_transfer_sequence_with_mock_measurement(configured_machine):

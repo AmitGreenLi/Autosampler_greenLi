@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 
 from autosampler.errors import ValidationError
 from autosampler.vessels.models import Vessel, VesselCategory
@@ -30,27 +31,35 @@ class Inventory:
         return matches[0]
 
     def validate_transfer(self, source_id: str, destination_id: str, amount_ul: float) -> tuple[Vessel, Vessel]:
-        if amount_ul <= 0:
+        if not math.isfinite(amount_ul) or amount_ul <= 0:
             raise ValidationError("Transfer amount must be greater than zero.")
         if source_id == destination_id:
             raise ValidationError("Source and destination must be different.")
         source, destination = self.get(source_id), self.get(destination_id)
         source.validate()
         destination.validate()
+        if source.category is VesselCategory.WASTE:
+            raise ValidationError("Cannot aspirate from an untracked Dump vessel.")
         if source.quantity_ul + 1e-9 < amount_ul:
             raise ValidationError(f"{source.name} contains insufficient liquid.")
-        if destination.quantity_ul + amount_ul > destination.capacity_ul + 1e-9:
+        if destination.category is not VesselCategory.WASTE and destination.quantity_ul + amount_ul > destination.capacity_ul + 1e-9:
             raise ValidationError(f"Transfer would overfill {destination.name}.")
         return source, destination
 
     def remove(self, location_id: str, amount_ul: float) -> None:
         vessel = self.get(location_id)
+        if vessel.category is VesselCategory.WASTE:
+            raise ValidationError("Cannot aspirate from an untracked Dump vessel.")
         if amount_ul < 0 or amount_ul > vessel.quantity_ul + 1e-9:
             raise ValidationError(f"Cannot remove {amount_ul:g} µL from {vessel.name}.")
         vessel.quantity_ul = max(0.0, vessel.quantity_ul - amount_ul)
 
     def add_volume(self, location_id: str, amount_ul: float) -> None:
         vessel = self.get(location_id)
+        if vessel.category is VesselCategory.WASTE:
+            if amount_ul < 0:
+                raise ValidationError("Cannot add a negative volume.")
+            return
         if amount_ul < 0 or vessel.quantity_ul + amount_ul > vessel.capacity_ul + 1e-9:
             raise ValidationError(f"Cannot add {amount_ul:g} µL to {vessel.name}.")
         vessel.quantity_ul += amount_ul

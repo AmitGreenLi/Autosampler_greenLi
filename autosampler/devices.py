@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
+from urllib.parse import urlsplit
 
 from autosampler.errors import AmbiguousDevice, DeviceNotFound
 
@@ -14,6 +15,8 @@ from autosampler.errors import AmbiguousDevice, DeviceNotFound
 class DeviceRole(str, Enum):
     GRBL = "grbl"
     SCALE = "scale"
+    GRBL_REMOTE = "grbl_remote"
+    SCALE_REMOTE = "scale_remote"
 
 
 @dataclass(frozen=True)
@@ -51,13 +54,22 @@ class DeviceIdentity:
     manufacturer: str | None = None
     product: str | None = None
     last_known_port: str | None = None
+    location: str | None = None
+    endpoint: str | None = None
 
     @classmethod
     def from_device(cls, device: SerialDeviceInfo) -> "DeviceIdentity":
-        return cls(device.serial_number, device.vid, device.pid, device.manufacturer, device.product, device.device)
+        return cls(
+            device.serial_number, device.vid, device.pid, device.manufacturer,
+            device.product, device.device, device.location,
+            urlsplit(device.device).netloc if device.device.startswith("ssh://") else None,
+        )
 
     def score(self, device: SerialDeviceInfo) -> int:
         """A positive score is identity evidence; port alone is never confident."""
+        endpoint = urlsplit(device.device).netloc if device.device.startswith("ssh://") else None
+        if self.endpoint != endpoint:
+            return 0
         if self.serial_number:
             if device.serial_number != self.serial_number:
                 return 0
@@ -67,11 +79,17 @@ class DeviceIdentity:
         if self.vid is not None and self.pid is not None:
             if (device.vid, device.pid) != (self.vid, self.pid):
                 return 0
+            # Serial-less USB adapters can share a VID:PID. Keep the physical
+            # USB location when available so two such adapters do not swap roles.
+            if self.location and device.location and self.location != device.location:
+                return 0
             expected = ((self.product, device.product), (self.manufacturer, device.manufacturer))
             for saved, found in expected:
                 if saved and found and saved != found:
                     return 0
             metadata = sum(bool(saved and found == saved) for saved, found in expected)
+            if self.location and device.location == self.location:
+                return 80 + metadata * 5
             return 70 + metadata * 5 if any(saved for saved, _ in expected) else 60
         return 10 if self.last_known_port == device.device else 0
 

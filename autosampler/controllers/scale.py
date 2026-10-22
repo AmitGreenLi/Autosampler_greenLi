@@ -9,6 +9,7 @@ from autosampler.controllers.interfaces import ScaleController
 from autosampler.errors import ConnectionFailure, ScaleError, ScaleUnstable, SerialPermissionError
 from autosampler.models import ScaleReading
 from autosampler.serial_diagnostics import serial_permission_message
+from autosampler.remote_serial import open_serial_port
 
 # A&D standard/CSV format: condition header, signed numeric value, three-character unit.
 _AAND_WEIGHT = re.compile(
@@ -47,6 +48,7 @@ class SerialScaleController(ScaleController):
         self._condition = threading.Condition()
         self._latest: ScaleReading | None = None
         self._sequence = 0
+        self._query_started = 0.0
         self._last_error: Exception | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -60,12 +62,17 @@ class SerialScaleController(ScaleController):
         with self._condition:
             return self._latest
 
+    def check_communication(self) -> None:
+        super().check_communication()
+        with self._condition:
+            if self._last_error:
+                raise ScaleError(str(self._last_error)) from self._last_error
+
     def connect(self) -> None:
         if not self.config.port or not self.config.baud_rate:
             raise ConnectionFailure("A&D FZ-500i serial port/baud rate is not configured.")
         try:
-            import serial
-            self._serial = serial.Serial(
+            self._serial = open_serial_port(
                 port=self.config.port,
                 baudrate=self.config.baud_rate,
                 bytesize=self.config.data_bits,
@@ -134,21 +141,38 @@ class SerialScaleController(ScaleController):
     def read_stable(self, stabilization_s: float | None, timeout_s: float = 10.0) -> ScaleReading:
         if stabilization_s is None:
             raise ScaleError("Scale stabilization time has not been calibrated.")
-        deadline = time.monotonic() + timeout_s
-        stable_since = None
-        while time.monotonic() < deadline:
-            reading = self.read()
-            if reading.stable:
-                stable_since = stable_since or time.monotonic()
-                if time.monotonic() - stable_since >= stabilization_s:
-                    return reading
-            else:
-                stable_since = None
-        raise ScaleUnstable("A&D FZ-500i did not stabilize before timeout.")
+        self.measure_stabilization(stabilization_s, timeout_s)
+        return self.latest_reading
+
+    def read_fresh(self, timeout_s: float, cancelled=None) -> ScaleReading:
+        from autosampler.errors import OperationAborted
+        barrier = time.monotonic()
+        deadline = barrier + timeout_s
+        with self._condition:
+            starting_sequence = self._sequence
+            while True:
+                if cancelled and cancelled():
+                    raise OperationAborted("Scale monitoring cancelled.")
+                if not self.connected:
+                    raise ConnectionFailure("A&D FZ-500i is disconnected.")
+                if self._last_error:
+                    raise ScaleError(str(self._last_error)) from self._last_error
+                if self._sequence > starting_sequence and self._latest is not None and self._query_started >= barrier:
+                    return self._latest
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # A healthy stream may have its next poll just beyond the
+                    # trial deadline. That is instability, not communication loss.
+                    if (self._latest is not None and
+                            time.monotonic() - self._query_started <= self.config.timeout_s + self.config.poll_interval_s):
+                        raise ScaleUnstable("Stabilization deadline reached between scale polls.")
+                    raise ScaleError("No fresh A&D weight response before the deadline.")
+                self._condition.wait(min(remaining, 0.05))
 
     def _reader_loop(self) -> None:
         while not self._stop.is_set():
             try:
+                query_started = time.monotonic()
                 reading = self._query_once()
             except ConnectionFailure as exc:
                 with self._condition:
@@ -164,6 +188,7 @@ class SerialScaleController(ScaleController):
             else:
                 with self._condition:
                     self._latest = reading
+                    self._query_started = query_started
                     self._sequence += 1
                     self._last_error = None
                     self._condition.notify_all()

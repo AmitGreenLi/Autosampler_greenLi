@@ -35,7 +35,8 @@ def build_runtime(mock_mode=True, paths=None, device_config_path=None):
     if mock_mode:
         grbl, scale = MockGrblController(), MockScaleController()
     else:
-        grbl, scale = SerialGrblController(config.grbl), SerialScaleController(config.scale)
+        grbl = SerialGrblController(config.grbl, homing_recovery_file=paths.config_dir / "homing-recovery.json")
+        scale = SerialScaleController(config.scale)
     machine = AutosamplerMachine(config, grbl, scale)
     # Simulation measurements must never unlock real hardware.
     machine.calibration_file = paths.config_dir / ("calibration-mock.json" if mock_mode else "calibration.json")

@@ -53,6 +53,29 @@ def test_vid_pid_product_match_without_serial_number():
     assert resolve_identity(identity, [scale]).selected == scale
 
 
+def test_serialless_ch341_reselected_by_saved_usb_identity():
+    selected = SerialDeviceInfo("/dev/ttyUSB0", vid=0x1A86, pid=0x7523, location="1-1.2")
+    identity = DeviceIdentity.from_device(selected)
+    assert resolve_identity(identity, [selected]).selected == selected
+
+    moved_path = SerialDeviceInfo("/dev/ttyUSB1", vid=0x1A86, pid=0x7523, location="1-1.2")
+    assert resolve_identity(identity, [moved_path]).selected == moved_path
+
+
+def test_serialless_identical_adapters_are_matched_by_usb_location():
+    grbl = SerialDeviceInfo("/dev/ttyUSB1", vid=0x1A86, pid=0x7523, location="1-1.2")
+    scale = SerialDeviceInfo("/dev/ttyUSB0", vid=0x1A86, pid=0x7523, location="1-1.4")
+    assert resolve_identity(DeviceIdentity.from_device(grbl), [scale, grbl]).selected == grbl
+    assert resolve_identity(DeviceIdentity.from_device(scale), [scale, grbl]).selected == scale
+    assert resolve_identity(DeviceIdentity.from_device(grbl), [scale]).selected is None
+
+
+def test_vid_pid_without_location_is_not_enough_to_select_a_role():
+    identity = DeviceIdentity(vid=0x1A86, pid=0x7523)
+    device = SerialDeviceInfo("/dev/ttyUSB0", vid=0x1A86, pid=0x7523)
+    assert resolve_identity(identity, [device]).selected is None
+
+
 def test_ambiguous_identical_usb_metadata_requires_manual_selection():
     identity = DeviceIdentity(vid=1, pid=2, product="Adapter")
     devices = [
@@ -81,6 +104,16 @@ def test_manual_selection_persists_saved_identity(tmp_path):
     loaded = DevicePreferenceStore(path).identity(DeviceRole.GRBL)
     assert loaded.serial_number == "S1"
     assert loaded.last_known_port == "COM7"
+
+
+def test_serialless_usb_location_persists(tmp_path):
+    store = DevicePreferenceStore(tmp_path / "devices.json")
+    store.associate(
+        DeviceRole.GRBL,
+        SerialDeviceInfo("/dev/ttyUSB0", vid=0x1A86, pid=0x7523, location="1-1.2"),
+    )
+    loaded = DevicePreferenceStore(store.path).identity(DeviceRole.GRBL)
+    assert loaded.location == "1-1.2"
 
 
 def test_display_name_contains_useful_usb_metadata():

@@ -27,6 +27,8 @@ def environment_diagnostics(paths, device_preferences, devices=None) -> dict:
         "log_directory": str(paths.log_dir),
         "grbl_mapping": _identity_dict(device_preferences.identity(DeviceRole.GRBL)),
         "scale_mapping": _identity_dict(device_preferences.identity(DeviceRole.SCALE)),
+        "glovebox_grbl_mapping": _identity_dict(device_preferences.identity(DeviceRole.GRBL_REMOTE)),
+        "glovebox_scale_mapping": _identity_dict(device_preferences.identity(DeviceRole.SCALE_REMOTE)),
         "serial_devices": [device.display_name for device in devices],
     }
 
@@ -50,4 +52,6 @@ def _identity_dict(identity):
         "manufacturer": identity.manufacturer,
         "product": identity.product,
         "last_known_port": identity.last_known_port,
+        "location": identity.location,
+        "endpoint": identity.endpoint,
     }

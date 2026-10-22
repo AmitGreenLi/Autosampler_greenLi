@@ -12,6 +12,10 @@ def test_guided_measurements_fill_typed_config_without_motion(configured_machine
     machine = configured_machine
     expected = deepcopy(machine.config)
     machine.config = MachineConfig()
+    machine.config.z.work_direction = expected.z.work_direction
+    machine.config.pipette_1.work_direction = expected.pipette_1.work_direction
+    machine.config.pipette_2.work_direction = expected.pipette_2.work_direction
+    machine.read_firmware_calibration()
     machine.calibration_file = tmp_path / "calibration.json"
     commands = list(machine.grbl.commands)
     for spec in measurements(machine.inventory.vessels):
@@ -40,7 +44,7 @@ def test_confirmation_and_consistency_required(configured_machine):
     for key, value, confirmed in (
         ("z.safe_position_mm", 1, False),
         ("z.safe_position_mm", 999, True),
-        ("pipette_1.volume_per_mm_ul", 0.1, True),
+        ("pipette_1.volume_per_step_ul", 0.00001, True),
         ("transfer.max_correction_attempts", 1.5, True),
         ("grbl.port", 1, True),
     ):
@@ -51,7 +55,6 @@ def test_confirmation_and_consistency_required(configured_machine):
 
 
 @pytest.mark.parametrize("operation", [
-    lambda m: m.go_to_spot("source", PipetteId.P1),
     lambda m: m.draw("source", 100, PipetteId.P1),
     lambda m: m.dispense("dest", 100, PipetteId.P1),
     lambda m: m.dump(PipetteId.P1),
@@ -75,7 +78,7 @@ def test_each_required_measurement_locks_automation(configured_machine):
         value = get_value(machine.config, spec.key)
         set_value(machine.config, spec.key, None)
         with pytest.raises(MissingCalibration):
-            machine.go_to_spot("source", PipetteId.P1)
+            machine.draw("source", 100, PipetteId.P1)
         set_value(machine.config, spec.key, value)
     assert machine.grbl.commands == before
 
@@ -122,7 +125,7 @@ def test_runtime_restores_measurements_without_trust_and_isolates_mock(tmp_path,
     first.record_calibration("z.safe_position_mm", 2, True)
     first.shutdown()
     second, _, _ = build_runtime(True, paths)
-    assert second.config.z.safe_position_mm == 2
+    assert second.config.z.safe_position_mm == -2
     assert not second.state.position_trusted
     assert not second.state.homed
     second.shutdown()
