@@ -128,6 +128,13 @@ by checking their USB descriptions and unplugging one at a time if necessary.
 Then tap **Connect GRBL** and **Connect Scale** separately. Connection to GRBL
 still invalidates coordinate trust and requires Home before motion.
 
+Remote serial reads use at most 50 ms of serial waiting per SSH exchange. Abort
+writes can acquire the transport between slices instead of waiting for the full
+two-second read timeout. SSH latency and a stalled network can still delay writes;
+this is not a guaranteed end-to-end stop time. The existing bridge protocol is
+unchanged and partial lines are assembled by the client. Keep the independent
+physical emergency stop accessible.
+
 The two source modes save separate device assignments. Serial-less USB
 adapters are remembered by USB location; keep them in the same physical USB
 sockets. If two adapters cannot be distinguished, the app asks for a manual

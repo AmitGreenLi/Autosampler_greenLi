@@ -33,7 +33,14 @@ class HomingSerial:
         self.writes.append(data)
         command = data.decode().strip()
         if data in (b"!", b"\x18"):
+            if data == b"\x18":
+                self.responses.append(b"Grbl 1.1h\n")
             return
+        if command == "?":
+            self.responses.append(b"<Idle|WPos:0,0,0,0,0>\n")
+            return
+        if command == "$I":
+            self.responses.append(b"[VER:1.1h:test]\n")
         if command == "$$":
             self.responses.extend(f"${k}={v:.3f}\n".encode() for k, v in self.settings.items())
         elif command.startswith("$") and "=" in command:
@@ -199,7 +206,7 @@ def test_lost_setting_ack_is_recovered_after_application_restart(controller, mon
     restarted = SerialGrblController(controller.config, homing_recovery_file=controller._homing_recovery_file)
     restarted._serial = HomingSerial(settings)
     serial = reconnect(restarted, monkeypatch)
-    assert serial.writes == [b"\x18", b"$25=100\n", b"$110=2000\n", b"$$\n"]
+    assert serial.writes == [b"$I\n", b"\x18", b"?", b"$25=100\n", b"$110=2000\n", b"$$\n"]
     assert serial.settings[25] == 100
     assert not restarted._homing_recovery_file.exists()
     restarted.home("Z")

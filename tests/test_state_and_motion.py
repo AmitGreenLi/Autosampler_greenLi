@@ -39,7 +39,7 @@ def test_axes_can_be_homed_individually_without_prematurely_trusting_machine(con
     machine.disconnect_grbl()
     machine.connect_grbl()
 
-    for axis in (Axis.CAROUSEL, Axis.Z, Axis.PIPETTE_1):
+    for axis in (Axis.Z, Axis.CAROUSEL, Axis.PIPETTE_1):
         machine.home(axis)
         assert machine.grbl.commands[-1] == f"$H{axis.value}"
         assert not machine.state.homed
@@ -57,6 +57,7 @@ def test_partially_homed_axis_can_be_jogged_and_counts_steps_from_home(configure
     machine = configured_machine
     machine.disconnect_grbl()
     machine.connect_grbl()
+    machine.home(Axis.Z)
     machine.home(Axis.CAROUSEL)
 
     machine.move_axis(Axis.CAROUSEL, 15, "degrees")
@@ -64,7 +65,7 @@ def test_partially_homed_axis_can_be_jogged_and_counts_steps_from_home(configure
     assert machine.state.operation_state is OperationState.RECOVERY_REQUIRED
 
     with pytest.raises(RecoveryRequired):
-        machine.move_axis(Axis.Z, 1, "mm")
+        machine.move_axis(Axis.PIPETTE_1, 1, "mm")
 
     machine.home(Axis.CAROUSEL)
     assert machine.steps_from_home(Axis.CAROUSEL) == 0

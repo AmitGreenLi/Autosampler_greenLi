@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 from autosampler.errors import ValidationError
 from autosampler.models import PipetteId
@@ -38,15 +39,13 @@ class TransferPlanner:
             cycles.append(remainder)
         return tuple(cycles)
 
-    def plan(self, amount_ul: float, prefer_p1_multicycle: bool | None = None) -> TransferPlan:
-        if amount_ul <= 0:
+    def plan(self, amount_ul: float, prefer_p1_multicycle: bool | None = None, buffer_percent: float = 0.0) -> TransferPlan:
+        if not math.isfinite(amount_ul) or amount_ul <= 0:
             raise ValidationError("Transfer amount must be greater than zero.")
-        if amount_ul <= self.p1_capacity_ul:
-            return TransferPlan(amount_ul, PipetteId.P1, (float(amount_ul),), False)
-        if amount_ul < self.p1_threshold_ul:
-            if prefer_p1_multicycle is False:
-                return TransferPlan(amount_ul, PipetteId.P2, (float(amount_ul),), False)
-            return TransferPlan(amount_ul, PipetteId.P1, self._cycles(amount_ul, self.p1_capacity_ul), True)
-        if amount_ul <= self.p2_capacity_ul:
-            return TransferPlan(amount_ul, PipetteId.P2, (float(amount_ul),), False)
-        return TransferPlan(amount_ul, PipetteId.P2, self._cycles(amount_ul, self.p2_capacity_ul), True)
+        if not math.isfinite(buffer_percent) or buffer_percent < 0:
+            raise ValidationError("Draw buffer must be finite and non-negative.")
+        use_p1 = amount_ul <= self.p1_capacity_ul or (amount_ul < self.p1_threshold_ul and prefer_p1_multicycle is not False)
+        pipette = PipetteId.P1 if use_p1 else PipetteId.P2
+        capacity = (self.p1_capacity_ul if use_p1 else self.p2_capacity_ul) / (1 + buffer_percent / 100)
+        cycles = self._cycles(amount_ul, capacity)
+        return TransferPlan(amount_ul, pipette, cycles, len(cycles) > 1)

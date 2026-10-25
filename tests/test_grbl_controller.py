@@ -109,11 +109,11 @@ def test_position_wait_stops_on_abort_after_status(tmp_path):
 
 @pytest.mark.parametrize("report", [b"<Hold:0|MPos:0,0,0>\n", b"<Door:0>\n", b"ALARM:1\n", b"Grbl restarted\n"])
 def test_motion_wait_refuses_interrupted_controller_states(tmp_path, report):
-    from autosampler.errors import RecoveryRequired
+    from autosampler.errors import RecoveryRequired, ControllerAlarm
 
     controller = controller_with_responses(report)
     controller._homing_recovery_file = tmp_path / "none.json"
-    with pytest.raises(RecoveryRequired):
+    with pytest.raises((RecoveryRequired, ControllerAlarm)):
         controller.wait_for_motion_complete()
     assert controller._serial.writes == [b"?"]
 

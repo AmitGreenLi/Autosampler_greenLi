@@ -58,6 +58,7 @@ class AutosamplerMachine:
             config.state_file = ApplicationPaths.platform_default().session_state
         self.store = store or StateStore(config.state_file)
         self.inventory = inventory if inventory is not None else self.store.load()
+        self.state.pipette_contents_ul = self.inventory.pipette_contents_ul
         self.planner = TransferPlanner(
             config.pipette_1.max_volume_ul,
             config.pipette_2.max_volume_ul,
@@ -204,7 +205,13 @@ class AutosamplerMachine:
                     self.state.operation_state = OperationState.RECOVERY_REQUIRED
                 if isinstance(exc, (ConnectionFailure, ScaleError)) and not self.scale.connected:
                     self.state.scale_connected = False
-                if grbl_lost or isinstance(exc, (OperationAborted, RecoveryRequired, ControllerAlarm)) or self.state.abort_requested or not self.state.position_trusted:
+                if (name in ("draw", "dispense", "dump", "clean", "transfer", "empty_pipette")
+                        and isinstance(exc, (ConnectionFailure, ScaleError))
+                        and not isinstance(exc, ScaleUnstable) and self.grbl.connected):
+                    self._fault_hold(str(exc))
+                if isinstance(exc, ControllerError) and self.grbl.connected:
+                    self._fault_hold(str(exc))
+                if grbl_lost or isinstance(exc, (OperationAborted, RecoveryRequired, ControllerError)) or self.state.abort_requested or not self.state.position_trusted:
                     self.state.invalidate_position(str(exc))
                     self.state.operation_state = OperationState.RECOVERY_REQUIRED
                 else:
@@ -291,16 +298,20 @@ class AutosamplerMachine:
                 self._warn_positioning_scale_unavailable(reason)
                 return
             if self.state.current_operation:
-                try:
-                    self._abort_generation += 1
-                    self.state.abort_requested = True
-                    self.grbl.hold_for_fault()
-                except Exception:
-                    log.exception("Could not request GRBL hold after scale loss")
-                finally:
-                    self.state.invalidate_position(reason + " Fault hold requested; motion/holding torque unconfirmed. No reset requested.")
-                    self.state.operation_state = OperationState.RECOVERY_REQUIRED
+                self._fault_hold(reason)
             log.error(reason)
+
+    def _fault_hold(self, reason):
+        try:
+            if self.grbl.connected and not self.state.abort_requested:
+                self._abort_generation += 1
+                self.state.abort_requested = True
+                self.grbl.hold_for_fault()
+        except Exception:
+            log.exception("Could not request GRBL fault hold")
+        finally:
+            self.state.invalidate_position(reason + " Fault hold requested; motion/holding torque unconfirmed. No reset requested.")
+            self.state.operation_state = OperationState.RECOVERY_REQUIRED
 
     def home(self, axis: Axis | str | None = None, *, abort_generation: int | None = None) -> None:
         with self._command_lock:
@@ -313,6 +324,9 @@ class AutosamplerMachine:
         generation = self._abort_generation if abort_generation is None else abort_generation
         if generation != self._abort_generation:
             raise OperationAborted("Homing request was cancelled by Abort/disconnection.")
+        if selected_axis is Axis.CAROUSEL:
+            self._require_z_clearance()
+            self._await_motion("Z", self.state.positions["Z"])
         axes = (selected_axis,) if selected_axis else (Axis.Z, Axis.CAROUSEL, Axis.PIPETTE_1, Axis.PIPETTE_2)
         # Check the complete sequence BEFORE changing trust or starting Z. An
         # unsafe A/B configuration must not be discovered after Z/X have moved.
@@ -358,6 +372,9 @@ class AutosamplerMachine:
                     self.grbl.home(item.value)
                 if generation != self._abort_generation:
                     raise OperationAborted("Homing was cancelled by Abort/disconnection.")
+                self._verify_homing_origin(item)
+                if generation != self._abort_generation:
+                    raise OperationAborted("Homing was cancelled during origin verification.")
                 log.info("HOMING_AXIS_COMPLETE %s", item.value)
             self.state.homing_progress = "Homing completed — all requested axes acknowledged completion."
             if selected_axis is None:
@@ -380,6 +397,19 @@ class AutosamplerMachine:
         finally:
             self.state.homing_axis_started_at = None
             self.state.current_operation = None
+
+    def _verify_homing_origin(self, axis):
+        from autosampler.position_tracking import PositionTracking
+        tracker = PositionTracking()
+        tracker.offset = dict(self.grbl.work_offsets)
+        report = self.grbl.status()
+        tracker.ingest(report)
+        resolution = {Axis.CAROUSEL: 1.0, Axis.Z: self.config.z.steps_per_mm,
+                      Axis.PIPETTE_1: self.config.pipette_1.steps_per_mm,
+                      Axis.PIPETTE_2: self.config.pipette_2.steps_per_mm}[axis]
+        actual = tracker.work.get(axis.value)
+        if tracker.controller_state != "Idle" or actual is None or not math.isclose(actual, 0.0, abs_tol=1 / resolution, rel_tol=0):
+            raise RecoveryRequired(f"HOMING_ORIGIN_MISMATCH {axis.value}: expected work zero within one step, received {report}. Verify firmware origin and WCO; no offset changed.")
 
     def unlock_for_calibration(self, *, abort_generation: int | None = None) -> str:
         """Send GRBL $X while retaining unknown coordinates and limiting use to manual jogs."""
@@ -451,6 +481,11 @@ class AutosamplerMachine:
                 raise OperationAborted("Abort is active; use Home before sending manual commands.")
             if self.state.current_operation:
                 raise ValidationError("Wait for the current operation to finish.")
+            if "~" in command:
+                report = self.grbl.status()
+                controller_state = report[1:].split("|", 1)[0].rstrip(">") if report.startswith("<") else "Unknown"
+                if controller_state not in ("Idle", "Alarm"):
+                    raise RecoveryRequired("Cycle start is blocked while interrupted motion may remain buffered; use deliberate Recover/reset.")
             generation = self._abort_generation
             self.state.invalidate_position("Manual command sent; Home is required before automated operation.", invalidate_measurement=False)
             # Raw movement leaves machine-coordinate measurement references intact.
@@ -488,19 +523,28 @@ class AutosamplerMachine:
         generation = self._abort_generation
         try:
             report = self.grbl.status()
-        except ConnectionFailure:
-            self.state.grbl_connected = False
-            self.state.invalidate_position("GRBL connection lost.")
+        except Exception as exc:
+            self.state.grbl_status_report = None
+            self.state.grbl_status_updated_at = None
+            if isinstance(exc, (ConnectionFailure, ControllerAlarm, RecoveryRequired)):
+                self.state.grbl_connected = False if isinstance(exc, ConnectionFailure) else self.grbl.connected
+                self.state.invalidate_position(str(exc))
+                self.state.operation_state = OperationState.RECOVERY_REQUIRED
             raise
         if generation != self._abort_generation:
             return report
         self._observe_report(report)
+        if not (report.startswith("<") and report.endswith(">")):
+            self.state.grbl_status_report = None
+            self.state.grbl_status_updated_at = None
+            return report
         match = re.search(r"(?:^|[|<])Pn:([^|>]*)", report)
         active = set(match.group(1).upper()) if match else set()
         self.state.limit_pins_pressed = {
             axis.value for axis in Axis if axis.value in active
         }
         self.state.grbl_status_report = report
+        self.state.grbl_status_updated_at = time.monotonic()
         return report
 
     def _observe_report(self, report):
@@ -566,6 +610,13 @@ class AutosamplerMachine:
         }[axis]
         return round(position_mm * steps_per_mm)
 
+    def _require_z_clearance(self):
+        z = self.config.z
+        actual = self.state.positions["Z"]
+        if ("Z" not in self.state.homed_axes or actual is None or z.safe_position_mm is None
+                or (actual - z.safe_position_mm) * z.work_direction > 1e-9):
+            raise RecoveryRequired("Home Z and move it to collision-free clearance before moving or homing X.")
+
     def move_axis(self, axis: Axis | str, amount: float, unit: str) -> dict:
         axis = Axis(axis)
         amount = float(amount)
@@ -577,6 +628,9 @@ class AutosamplerMachine:
             allow_calibration_bypass=True,
             allow_homed_axis=axis,
         ):
+            if axis is Axis.CAROUSEL:
+                self._require_z_clearance()
+                self._await_motion("Z", self.state.positions["Z"])
             grbl_amount, physical_steps, actual = self._convert_manual_move(axis, amount, unit)
             start = self.state.positions[axis.value]
             response = self.grbl.move_relative(axis.value, grbl_amount)
@@ -726,13 +780,7 @@ class AutosamplerMachine:
             except Exception:
                 # The first leg may still be moving. Never queue a return or reset
                 # in response to an uncertain motion result.
-                if self.grbl.connected and not self.state.abort_requested and not self.grbl.recovery_required:
-                    try:
-                        self.grbl.hold_for_fault()
-                    except Exception:
-                        log.exception("Could not request hold after positioning failure")
-                self.state.invalidate_position("Carousel positioning failed/interrupted; Home is required.")
-                self.state.operation_state = OperationState.RECOVERY_REQUIRED
+                self._fault_hold("Carousel positioning failed/interrupted; Home is required.")
                 raise
             self.state.carousel_steps = target
             self.state.positions[Axis.CAROUSEL.value] = float(target)
@@ -879,13 +927,7 @@ class AutosamplerMachine:
                 return result
             except Exception:
                 self.overshoot_progress = "Stopped or failed; previous setting restored. Recover GRBL connection, then Home all axes before restarting."
-                if self.grbl.connected and not self.state.abort_requested and not self.grbl.recovery_required:
-                    try:
-                        self.grbl.hold_for_fault()
-                    except Exception:
-                        log.exception("Could not request fault hold after calibration failure")
-                    finally:
-                        self.state.invalidate_position("Overshoot calibration interrupted; Home is required.")
+                self._fault_hold("Overshoot calibration interrupted; Home is required.")
                 raise
             finally:
                 self.config.carousel_overshoot_deg = previous
@@ -985,6 +1027,15 @@ class AutosamplerMachine:
         self.grbl.move_absolute(cfg.axis, position, feed)
         self.state.positions[cfg.axis] = position
 
+    def _await_motion(self, axis, target):
+        generation = self._abort_generation
+        try:
+            self.grbl.wait_for_axis_position(axis, target, cancelled=lambda:
+                self.state.abort_requested or generation != self._abort_generation or not self.grbl.connected)
+        except Exception:
+            self._fault_hold(f"Could not confirm {axis} motion completion.")
+            raise
+
     def _aspirate_motion(self, volume_ul: float, pipette: PipetteId) -> None:
         cfg = self._pipette_config(pipette)
         travel = self._travel_for_volume(volume_ul, pipette)
@@ -992,6 +1043,7 @@ class AutosamplerMachine:
         self._move_pipette(cfg, contact)
         self._move_pipette(cfg, contact + cfg.work_direction * travel, cfg.speed_mm_min)
         self._move_pipette(cfg, cfg.home_position_mm, cfg.speed_mm_min)
+        self._await_motion(cfg.axis, cfg.home_position_mm)
         self.state.pipette_contents_ul[pipette.value] += round(travel * cfg.steps_per_mm) * cfg.volume_per_step_ul
 
     def _dispense_motion(self, volume_ul: float, pipette: PipetteId) -> float:
@@ -1007,6 +1059,7 @@ class AutosamplerMachine:
         self._move_pipette(cfg, contact)
         self._move_pipette(cfg, contact + cfg.work_direction * travel, cfg.speed_mm_min)
         self._move_pipette(cfg, cfg.home_position_mm, cfg.speed_mm_min)
+        self._await_motion(cfg.axis, cfg.home_position_mm)
         self.state.pipette_contents_ul[pipette.value] = max(0.0, held - actual_ul)
         return actual_ul
 
@@ -1031,6 +1084,7 @@ class AutosamplerMachine:
         self._move_pipette(cfg, endpoint, cfg.speed_mm_min)
         self._move_pipette(cfg, cfg.home_position_mm, cfg.speed_mm_min)
         emptied = self.state.pipette_contents_ul[pipette.value]
+        self._await_motion(cfg.axis, cfg.home_position_mm)
         self.state.pipette_contents_ul[pipette.value] = 0.0
         return emptied
 
@@ -1049,7 +1103,7 @@ class AutosamplerMachine:
             )
         return CylinderGeometry(a.beaker_internal_diameter_mm, vessel.capacity_ul)
 
-    def aspiration_z(self, vessel, pipette: PipetteId) -> float:
+    def aspiration_z(self, vessel, pipette: PipetteId, remaining_ul=None) -> float:
         """Calculate using the vessel family; P1 and P2 tips share a height."""
         if vessel.category is VesselCategory.WASTE:
             raise ValidationError("Cannot aspirate from an untracked Dump vessel.")
@@ -1060,8 +1114,9 @@ class AutosamplerMachine:
         family = "vial" if vessel.vessel_type is VesselType.VIAL_15ML else "beaker"
         bottom = getattr(a, f"{family}_bottom_mm")
         internal_height = getattr(a, f"{family}_internal_height_mm")
-        liquid_height = self._geometry(vessel).liquid_height_mm(vessel.quantity_ul)
-        if liquid_height > internal_height:
+        geometry = self._geometry(vessel)
+        liquid_height = geometry.liquid_height_mm(vessel.quantity_ul if remaining_ul is None else remaining_ul)
+        if geometry.liquid_height_mm(vessel.quantity_ul) > internal_height or liquid_height > internal_height:
             raise ValidationError("Calculated liquid level exceeds calibrated vessel height.")
         height = liquid_height - self.config.transfer.aspiration_immersion_depth_mm
         if height < a.bottom_clearance_mm or height >= liquid_height:
@@ -1071,8 +1126,27 @@ class AutosamplerMachine:
             raise ValidationError(self.config.z.target_error(target))
         return target
 
+    @contextmanager
+    def _draw_accounting(self, source_id, pipette):
+        progress = {"started": False}
+        try:
+            yield progress
+        except Exception:
+            if progress["started"]:
+                self.inventory.unverified_sources.add(source_id)
+                self.inventory.dump_required.add(pipette.value)
+                try:
+                    self.store.save(self.inventory)
+                except Exception:
+                    log.exception("Could not persist uncertain liquid state; verify source and empty tip before reuse")
+            raise
+
     def draw(self, source_id: str, requested_ul: float, pipette: PipetteId, buffer_percent: float | None = None) -> float:
-        with self._operation("draw"):
+        with self._operation("draw"), self._draw_accounting(source_id, pipette) as progress:
+            if self.inventory.dump_required:
+                raise ValidationError("Pipette liquid is unverified; Dump the affected pipette before drawing again.")
+            if source_id in self.inventory.unverified_sources:
+                raise ValidationError("Source quantity is unverified; confirm and Apply vessel setup before drawing.")
             source = self.inventory.get(source_id)
             if source.category is VesselCategory.WASTE:
                 raise ValidationError("Cannot aspirate from an untracked Dump vessel.")
@@ -1099,18 +1173,26 @@ class AutosamplerMachine:
                 raise MissingCalibration("Transfer correction limits have not been calibrated.")
             if immersion is None:
                 raise MissingCalibration("Aspiration Z geometry has not been calibrated.")
-            z_target = self.aspiration_z(source, pipette)
+            z_target = self.aspiration_z(source, pipette, source.quantity_ul - target)
             self._travel_for_volume(target, pipette)
             self.go_to_spot(source_id, pipette)
+            self._await_motion("X", self.state.positions["X"])
             baseline = self.scale.read_stable(self.config.transfer.scale_stabilization_time_s)
             self.state.scale_reading = baseline
             self._move_z(z_target)
+            self._await_motion("Z", z_target)
             correction = target
             measured = 0.0
             for attempt in range(1, attempts + 1):
                 if self.state.abort_requested:
                     raise OperationAborted("Draw aborted.")
                 if abs(correction) >= minimum:
+                    if not progress["started"]:
+                        # Write-ahead uncertainty survives interruption or application loss.
+                        self.inventory.unverified_sources.add(source_id)
+                        self.inventory.dump_required.add(pipette.value)
+                        self.store.save(self.inventory)
+                        progress["started"] = True
                     if correction > 0:
                         self._aspirate_motion(correction, pipette)
                     else:
@@ -1124,6 +1206,9 @@ class AutosamplerMachine:
                     self.inventory.remove(source_id, measured)
                     self.state.pipette_contents_ul[pipette.value] = measured
                     self._move_z_safe()
+                    self._await_motion("Z", self.config.z.safe_position_mm)
+                    self.inventory.unverified_sources.discard(source_id)
+                    self.inventory.dump_required.discard(pipette.value)
                     self.store.save(self.inventory)
                     return measured
             raise CorrectionFailure(f"Draw did not converge after {attempts} correction attempts (error {correction:g} µL).")
@@ -1135,14 +1220,19 @@ class AutosamplerMachine:
             if self.config.z.dispense_position_mm is None:
                 raise MissingCalibration("Z dispense position has not been calibrated.")
             self._move_z(self.config.z.dispense_position_mm)
+            self._await_motion("Z", self.config.z.dispense_position_mm)
             amount = self.empty_pipette(pipette)
             self.inventory.add_volume(waste.location_id, amount)
             self._move_z_safe()
+            self._await_motion("Z", self.config.z.safe_position_mm)
+            self.inventory.dump_required.discard(pipette.value)
             self.store.save(self.inventory)
             return amount
 
     def dispense(self, destination_id: str, amount_ul: float, pipette: PipetteId) -> None:
         with self._operation("dispense"):
+            if pipette.value in self.inventory.dump_required:
+                raise ValidationError("Pipette liquid is unverified; Dump is required.")
             destination = self.inventory.get(destination_id)
             destination.validate()
             if not math.isfinite(amount_ul) or amount_ul <= 0:
@@ -1159,9 +1249,11 @@ class AutosamplerMachine:
             if self.config.z.dispense_position_mm is None:
                 raise MissingCalibration("Z dispense position has not been calibrated.")
             self._move_z(self.config.z.dispense_position_mm)
+            self._await_motion("Z", self.config.z.dispense_position_mm)
             actual_ul = self._dispense_motion(amount_ul, pipette)
             self.inventory.add_volume(destination_id, actual_ul)
             self._move_z_safe()
+            self._await_motion("Z", self.config.z.safe_position_mm)
             self.store.save(self.inventory)
             self.dump(pipette)  # invariant: every normal dispense is followed by dump
 
@@ -1178,19 +1270,24 @@ class AutosamplerMachine:
                 if self.config.z.dispense_position_mm is None:
                     raise MissingCalibration("Z dispense position has not been calibrated.")
                 self._move_z(self.config.z.dispense_position_mm)
+                self._await_motion("Z", self.config.z.dispense_position_mm)
                 returned = self.empty_pipette(pipette)
                 self.inventory.add_volume(cleaning.location_id, returned)
                 self._move_z_safe()
+                self._await_motion("Z", self.config.z.safe_position_mm)
             self.store.save(self.inventory)
 
-    def plan_transfer(self, amount_ul: float, prefer_p1_multicycle: bool | None = None) -> TransferPlan:
-        return self.planner.plan(amount_ul, prefer_p1_multicycle)
+    def plan_transfer(self, amount_ul: float, prefer_p1_multicycle: bool | None = None, buffer_percent=None) -> TransferPlan:
+        buffer = self.config.transfer.default_draw_buffer_percent if buffer_percent is None else buffer_percent
+        if buffer is None:
+            raise MissingCalibration("Default draw buffer percentage has not been calibrated.")
+        return self.planner.plan(amount_ul, prefer_p1_multicycle, buffer)
 
     def transfer(self, source_id: str, destination_id: str, amount_ul: float,
                  confirm_multicycle: bool | None = None, prefer_p1_multicycle: bool | None = None,
                  buffer_percent: float | None = None) -> TransferPlan:
         self.inventory.validate_transfer(source_id, destination_id, amount_ul)
-        plan = self.plan_transfer(amount_ul, prefer_p1_multicycle)
+        plan = self.plan_transfer(amount_ul, prefer_p1_multicycle, buffer_percent)
         if plan.requires_confirmation and confirm_multicycle is not True:
             if confirm_multicycle is False:
                 raise ValidationError("Multi-cycle transfer was declined.")
@@ -1201,10 +1298,27 @@ class AutosamplerMachine:
                 self.dispense(destination_id, cycle, plan.pipette)
             return plan
 
+    def apply_inventory(self, inventory):
+        with self._command_lock:
+            if self.state.current_operation:
+                raise ValidationError("Wait for the current operation to finish.")
+            # Editing vessel quantities cannot clear a required physical Dump.
+            inventory.dump_required = set(self.inventory.dump_required)
+            inventory.pipette_contents_ul = self.state.pipette_contents_ul
+            self.store.save(inventory)
+            self.inventory = inventory
+
     def reset_session(self, confirmed: bool = False) -> None:
         if not confirmed:
             raise ValidationError("Session reset requires explicit confirmation.")
-        self.inventory = self.store.reset()
+        with self._command_lock:
+            if self.state.current_operation:
+                raise ValidationError("Wait for the current operation to finish.")
+            dump_required = set(self.inventory.dump_required)
+            self.inventory = self.store.reset()
+            self.inventory.dump_required = dump_required
+            self.inventory.pipette_contents_ul = self.state.pipette_contents_ul
+            self.store.save(self.inventory)
         log.warning("Persistent liquid/session state reset; physical position unchanged")
 
     def poll_reference_sensor(self, sensor) -> bool:

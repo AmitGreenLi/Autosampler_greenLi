@@ -4,7 +4,7 @@ import queue
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable
-from autosampler.errors import OperationAborted
+from autosampler.errors import OperationAborted, CommandCancelled
 
 
 @dataclass
@@ -32,12 +32,12 @@ class MachineWorker:
         if not self._thread.is_alive():
             self._thread.start()
 
-    def submit(self, name: str, function: Callable, *args, **kwargs) -> None:
+    def submit(self, name: str, function: Callable, *args, cancel_on_error: bool = True, **kwargs) -> None:
         with self._queue_lock:
             if not self._accepting:
                 raise RuntimeError("Machine worker is shutting down and cannot accept commands.")
             self._pending += 1
-            self.commands.put((self._generation, name, function, args, kwargs))
+            self.commands.put((self._generation, name, function, args, kwargs, cancel_on_error))
 
     @property
     def busy(self) -> bool:
@@ -52,7 +52,7 @@ class MachineWorker:
             self.submit(name, function, *args, **kwargs)
             return True
 
-    def cancel_pending(self, reason="Pending command cancelled by Abort.") -> None:
+    def cancel_pending(self, reason="Pending command cancelled by Abort.", error_type=OperationAborted) -> None:
         with self._queue_lock:
             self._generation += 1
             while True:
@@ -62,7 +62,7 @@ class MachineWorker:
                     break
                 if item is not None:
                     self._pending -= 1
-                    self.events.put(WorkerEvent("cancelled", item[1], OperationAborted(reason)))
+                    self.events.put(WorkerEvent("cancelled", item[1], error_type(reason)))
 
     def stop(self, cancel_pending: bool = True, timeout_s: float = 10.0) -> bool:
         self._accepting = False
@@ -78,7 +78,7 @@ class MachineWorker:
             item = self.commands.get()
             if item is None:
                 break
-            generation, name, function, args, kwargs = item
+            generation, name, function, args, kwargs, cancel_on_error = item
             with self._queue_lock:
                 self._pending -= 1
                 if generation != self._generation:
@@ -90,7 +90,8 @@ class MachineWorker:
                 result = function(*args, **kwargs)
                 self.events.put(WorkerEvent("completed", name, result))
             except Exception as exc:
-                self.cancel_pending("Pending command cancelled after a machine command failed.")
+                if cancel_on_error:
+                    self.cancel_pending("Pending command cancelled after a machine command failed.", CommandCancelled)
                 self.events.put(WorkerEvent("error", name, exc))
             finally:
                 with self._queue_lock:

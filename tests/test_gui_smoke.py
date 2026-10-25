@@ -282,6 +282,8 @@ def test_pyside_window_constructs_with_mock_backend(tmp_path, monkeypatch):
     assert window.limit_indicators["Z"].text() == "Z  PRESSED"
     assert window.limit_indicators["B"].text() == "B  PRESSED"
     assert window.limit_indicators["X"].text() == "X  open"
+    machine.home("Z")
+    machine.config.z.safe_position_mm = 0.0
     machine.home("X")
     machine.move_axis("X", 15, "degrees")
     window._render_state(machine.state)

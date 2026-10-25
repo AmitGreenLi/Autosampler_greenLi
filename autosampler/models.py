@@ -58,6 +58,7 @@ class MachineState:
     homed_axes: set[str] = field(default_factory=set)
     limit_pins_pressed: set[str] = field(default_factory=set)
     grbl_status_report: str | None = None
+    grbl_status_updated_at: float | None = None
     vessel_under_pipette: str | None = None
     pipette_contents_ul: dict[str, float] = field(
         default_factory=lambda: {PipetteId.P1.value: 0.0, PipetteId.P2.value: 0.0}

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -65,7 +67,7 @@ MEASUREMENTS = (
     Measurement("transfer.default_draw_buffer_percent", "Draw buffer (%)", minimum=0),
     Measurement("transfer.tolerance_ul", "Transfer tolerance (µL)", positive=True),
     Measurement("transfer.max_correction_attempts", "Maximum correction attempts", positive=True, integer=True),
-    Measurement("transfer.scale_stabilization_time_s", "Scale stabilization timeout (s)", minimum=0),
+    Measurement("transfer.scale_stabilization_time_s", "Scale stabilization hold (s)", minimum=0),
     Measurement("transfer.minimum_correction_volume_ul", "Minimum correction (µL)", positive=True),
     Measurement("transfer.aspiration_immersion_depth_mm", "Aspiration: tip depth below liquid surface (mm)", positive=True),
 )
@@ -193,11 +195,11 @@ def aspiration_measurement_help(key):
             "Enter a small positive depth that keeps the pipette opening submerged during aspiration. "
             "The program estimates liquid surface height from the vessel's recorded quantity and calibrated "
             "internal dimensions; no separate liquid-top coordinate is required. "
-            "Tip height above bottom = calculated liquid height − this depth. "
+            "Tip height above bottom = predicted remaining liquid height after draw plus buffer − this depth. "
             "Machine Z = vessel-bottom Z + upward direction × tip height. "
             "The same depth applies to P1 and P2 and to aspiration during Draw, Transfer, and Clean. "
             "The target is calculated before each draw; the program does not sense or continuously follow "
-            "the falling liquid surface during a stroke. Choose a depth validated for the intended draw volume. "
+            "the falling liquid surface during a stroke. The fixed target accounts for the requested draw plus buffer. "
             "A target below the minimum bottom clearance is rejected. "
             "Bottom-to-rim height describes the vessel, not its current liquid level."
         )
@@ -267,6 +269,9 @@ def set_value(config, key, value):
 
 def geometry_errors(config):
     errors = []
+    t = config.transfer
+    if t.minimum_correction_volume_ul is not None and t.tolerance_ul is not None and t.minimum_correction_volume_ul > t.tolerance_ul:
+        errors.append("Minimum correction volume must not exceed tolerance")
     z = config.z
     if z.max_travel_mm is not None:
         for field in ("safe_position_mm", "dispense_position_mm"):
@@ -322,11 +327,19 @@ def save_calibration(config, path, locations):
     path = Path(path)
     values = {m.key: get_value(config, m.key) for m in measurements(locations) + FIRMWARE_MEASUREMENTS}
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"version": 1, "z_work_direction": config.z.work_direction,
-        "pipette_work_directions": {p.axis: p.work_direction for p in (config.pipette_1, config.pipette_2)},
-        "values": values}, allow_nan=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    payload = {"version": 1, "z_work_direction": config.z.work_direction,
+               "pipette_work_directions": {p.axis: p.work_direction for p in (config.pipette_1, config.pipette_2)},
+               "values": values}
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, allow_nan=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def load_calibration(config, path, locations):

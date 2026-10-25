@@ -69,6 +69,8 @@ class SerialScaleController(ScaleController):
                 raise ScaleError(str(self._last_error)) from self._last_error
 
     def connect(self) -> None:
+        if self.connected:
+            return
         if not self.config.port or not self.config.baud_rate:
             raise ConnectionFailure("A&D FZ-500i serial port/baud rate is not configured.")
         try:
@@ -141,8 +143,9 @@ class SerialScaleController(ScaleController):
     def read_stable(self, stabilization_s: float | None, timeout_s: float = 10.0) -> ScaleReading:
         if stabilization_s is None:
             raise ScaleError("Scale stabilization time has not been calibrated.")
-        self.measure_stabilization(stabilization_s, timeout_s)
-        return self.latest_reading
+        qualifying = []
+        self.measure_stabilization(stabilization_s, timeout_s, on_reading=qualifying.append)
+        return qualifying[-1]
 
     def read_fresh(self, timeout_s: float, cancelled=None) -> ScaleReading:
         from autosampler.errors import OperationAborted

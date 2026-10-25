@@ -20,8 +20,10 @@ def build_runtime(mock_mode=True, paths=None, device_config_path=None):
     paths = paths or ApplicationPaths.platform_default()
     paths.ensure()
     legacy_state = Path(__file__).resolve().parent.parent / "autosampler_state.json"
-    paths.migrate_legacy_session(legacy_state)
-    config = MachineConfig(state_file=paths.session_state, log_file=paths.log_file)
+    if not mock_mode:
+        paths.migrate_legacy_session(legacy_state)
+    state_file = paths.data_dir / "session_state-mock.json" if mock_mode else paths.session_state
+    config = MachineConfig(state_file=state_file, log_file=paths.log_file)
     configure_logging(config.log_file)
     preferences = DevicePreferenceStore(device_config_path or paths.device_preferences)
     devices = [] if mock_mode else discover_serial_devices()

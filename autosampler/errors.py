@@ -57,5 +57,9 @@ class OperationAborted(AutosamplerError):
     pass
 
 
+class CommandCancelled(AutosamplerError):
+    """A queued action could not run because an earlier machine action failed."""
+
+
 class CorrectionFailure(AutosamplerError):
     pass

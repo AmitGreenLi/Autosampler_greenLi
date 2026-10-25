@@ -8,6 +8,10 @@ from autosampler.models import ScaleReading
 
 class GrblController(ABC):
     @property
+    def work_offsets(self) -> dict[str, float]:
+        return {}
+
+    @property
     def recovery_required(self) -> bool:
         return False
 

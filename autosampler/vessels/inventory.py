@@ -8,6 +8,9 @@ from autosampler.vessels.models import Vessel, VesselCategory
 class Inventory:
     def __init__(self, vessels=()):
         self.vessels: dict[str, Vessel] = {v.location_id: v for v in vessels}
+        self.unverified_sources: set[str] = set()
+        self.dump_required: set[str] = set()
+        self.pipette_contents_ul = {"P1": 0.0, "P2": 0.0}
 
     def add(self, vessel: Vessel) -> None:
         vessel.validate()

@@ -85,11 +85,11 @@ If GRBL disappears, the workflow is cancelled, the controller is marked disconne
 ## Preserved machine behavior
 
 - Axis mapping remains X carousel, Z carriage, A Pipette 1, B Pipette 2.
-- GUI Home all runs `$HZ`, `$HX`, `$HA`, `$HB` in that order. Individual axis homing remains available. Partial homing remains untrusted until all four application axes have been homed.
+- GUI Home all runs `$HZ`, `$HX`, `$HA`, `$HB` in that order. Individual X homing and X jogging require Z homed and at or above calibrated collision-free clearance, including calibration-unlock jogging. Partial homing remains untrusted until all four application axes have been homed. After each cycle the sender requires Idle and reported work zero within one application step; missing or mismatched coordinates withhold trust without changing WCO. Check the installed firmware's homing-origin convention if `HOMING_ORIGIN_MISMATCH` appears.
 - X uses a 30 degrees/second initial search (`MachineConfig.carousel_homing_search_deg_s`), equivalent to `9333.33333` X units/min with the current `140/27` conversion. The sender temporarily sets `$25` and, if needed, raises X's `$110` speed cap for `$HX` only. Existing `$24` locating speed, `$27` pull-off distance, acceleration, and other axes' speeds are retained. Acceleration may prevent reaching the requested speed during a short search. Switch detection, including a switch already pressed at startup, stays inside the standard firmware homing cycle; a switch that cannot clear within the configured pull-off distance causes a homing alarm.
 - Z similarly uses `$25=1000` for `$HZ` (`MachineConfig.z_homing_search_rate`, in GRBL units/min), restoring the original `$25` afterward, normally `60`. If necessary, its `$112` speed cap is temporarily raised and restored. This applies to individual Z homing and Home all; restoration is verified before starting X. The same persistent settings recovery and pulse-rate preflight checks apply. `$24`, `$27`, and Z homing direction are retained.
-- X homing checks `$22=1`, positive X homing direction (X bit of `$23` clear), and sufficient `$130` travel for a complete carousel revolution plus pull-off clearance, using this project's firmware search multiplier of 1.5. It reports incompatible settings without changing them. The sender does not change `$100`; the current hardware's previously confirmed value is `32`.
-- Before temporary EEPROM writes, the sender saves the original values to `homing-recovery.json` in the application configuration directory. After successful X homing it restores and reads back the settings before continuing to A/B or trusting X. An alarm, timeout, Abort, failed restoration, or lost connection requires reconnection; further commands are blocked. Reconnection resets/flushes the controller and restores pending settings, including after an application restart. Recovery requires the original serial port; a different port is rejected to avoid applying values to another controller. These are EEPROM writes on each X homing cycle; do not repeatedly home in a tight loop.
+- X homing checks `$22=1`, positive X homing direction (X bit of `$23` clear), and sufficient `$130` travel for a complete carousel revolution plus pull-off clearance, using this project's firmware search multiplier of 1.5. It reports incompatible settings without changing them. The sender does not change `$100`. A previously recorded value is `32`; confirm it against the installed driver's microstepping and measured rotation before treating it as correct.
+- Before temporary EEPROM writes, the sender saves the original values to `homing-recovery.json` in the application configuration directory. After successful X homing it restores and reads back the settings before continuing to A/B or trusting X. An alarm, timeout, Abort, failed restoration, or lost connection requires reconnection; further commands are blocked. Connect observes startup and verifies a read-only `$I` build response before sending pending recovery resets or settings. A bridge reconnect without a banner is supported. Pending settings recovery uses the existing explicit reset, waits for startup, then restores and verifies settings, including after an application restart. Recovery checks the recorded port path and, for new records, the GRBL build string; USB serial number/location is not checked, so an identical adapter/controller swapped onto that path cannot be distinguished. Old port-only records remain supported. These are EEPROM writes on each X homing cycle; do not repeatedly home in a tight loop.
 - Homing uses a separate five-minute response window because GRBL sends its final `ok` only after the physical homing cycle completes; ordinary serial commands retain the short device timeout.
 - Before GUI/API Home, the sender reads `$$` once to check the entire requested
   sequence against the installed Mega 5X firmware's nominal 30,000 steps/s ceiling.
@@ -139,8 +139,10 @@ If GRBL disappears, the workflow is cancelled, the controller is marked disconne
   for the homing stop limitation. Independent mechanical support/braking is needed
   to protect an axis if reset, power loss, or a driver fault releases holding torque.
 - Carousel conversion remains `140/27` full motor steps per degree with integer Python targets.
-- Z remains 80 steps/mm. A and B use standard 1.8° NEMA17 motors (200 full steps/revolution), 2 mm of actuator travel per motor revolution, and 1/16 DRV8825 microstepping: `200 / 2 × 16 = 1600` driver steps/mm.
+- Application conversions are Z 80 steps/mm and A/B 1600 driver steps/mm (200 full steps/revolution, 2 mm/revolution, 1/16 microstepping). Homing preflight logs a read-only warning when reported `$102`–`$104` differ from these defaults; it never changes resolution settings. Verify the actual drivers and physical travel independently.
 - Exactly 200 µL uses P1. The existing 1.1 mL and 10 mL planning boundaries are unchanged.
+- Each transfer cycle reserves capacity for the selected draw buffer. A buffer can add a cycle, including at exactly 200 µL or 10 mL, and that plan requires confirmation. Liquid strokes and relevant Z/carousel moves must report completion before dependent scale measurements or completed-volume saves. Draw depth uses the predicted liquid level remaining after the full draw plus buffer and rejects insufficient bottom clearance.
+- A failed draw after a stroke marks the source quantity unverified and requires Dump for the affected pipette. These flags and pipette accounting survive restart. Dump clears the tip flag; physically verify the source quantity and Apply vessel setup before drawing from it again. No automatic fault retraction is attempted. Simulation uses `session_state-mock.json`; hardware retains `session_state.json`, including legacy migration.
 - Dispense always dumps afterward and never cleans automatically.
 - Cleaning returns liquid to the Cleaning Beaker.
 - Abort uses feed hold/reset, cancels workflow trust and pending commands, and on real hardware requires reconnection followed by operator-initiated Home.
@@ -165,7 +167,7 @@ The balance is RS-232C DCE equipment with a female D-sub 9-pin connector. A&D sp
 
 ## GRBL carousel coordinates
 
-The chosen representation remains one GRBL X coordinate unit per physical full carousel-motor step, requiring the installed GRBL Mega 5X Edge build to be verified/configured with `$100=1`. Python converts calibrated degrees once and sends integer X targets. A recurring reference event synchronizes the active work coordinate with `G10 L20 P1 X0`.
+The application represents one GRBL X coordinate unit as one physical full carousel-motor step. `$100` is driver pulses per coordinate unit, so the correct value depends on the installed driver's microstepping; neither `1` nor `32` is universally correct. Verify one physical revolution against the application's integer target and record the driver configuration. Python converts calibrated degrees once and sends integer X targets. A recurring reference event synchronizes the active work coordinate with `G10 L20 P1 X0`.
 
 A recurring index pulse must not be wired as an ordinary hard limit that alarms during normal rotation. The exact non-limit firmware/input route remains a hardware integration decision. A future Raspberry Pi GPIO input can be added by implementing `CarouselReferenceSensor`; no Pi-specific dependency is currently required.
 
@@ -206,6 +208,8 @@ so sending one invalidates position trust. Use Home before automated operations.
 The terminal requires a connection, waits for the current operation to finish,
 and stays blocked after Abort until recovery through Home. Abort continues to
 send realtime feed hold/reset without waiting for a command response.
+Over SSH, each serial read slice waits at most 50 ms before allowing a write; network latency or a stalled link adds to that delay. See [glovebox transport details](docs/GLOVEBOX_BRIDGE.md).
+Manual `~` is blocked unless a fresh report says Idle or Alarm. Connect latches recovery for Hold, Run, Door or Jog so interrupted buffered motion requires deliberate recovery/reset. Opening a USB serial port can itself reset some boards through DTR/RTS; software connection checks do not establish holding torque.
 
 The **Manual Calibration** tab includes a guided measurement form. Add the intended vessel locations on the Vessels tab first, then work through **Next missing measurement**:
 
@@ -246,7 +250,7 @@ within the same connection. Configure **$13=0** (metric status reporting) on the
 controller; the panel assumes this initially and does not query or change settings.
 If an observed settings response or manual setting enables inch reports, the panel
 requires `$13=0` before measurements are available. X units are logical carousel
-steps under this project's `$100=1` firmware convention; Z/A/B units are mm.
+steps under the application's full-step X coordinate convention; verify `$100` against driver microstepping. Z/A/B units are mm.
 Firmware with a different axis order or reporting convention requires adapting
 the parser. Changes made through another controller client, or a reset whose
 startup banner is lost, cannot reliably be detected from positions alone.
@@ -276,7 +280,7 @@ All tests use mock hardware. CI is configured for Windows and Linux with Qt's of
 
 - Confirm X/Z/A/B motor directions and GRBL axis/settings mapping.
 - Confirm every home-switch direction, polarity, pull-up behavior, and failure response.
-- Confirm `$100=1` yields one physical carousel full step per X unit.
+- Confirm the installed X microstepping and `$100` yield one physical full carousel step per X unit; verify a complete revolution independently.
 - Confirm `G10 L20 P1 X0` and the selected work-coordinate policy on the installed firmware.
 - Validate the recurring carousel index input without hard-limit alarms.
 - Measure collision-free Z safe, dispense, and aspiration positions.

@@ -9,7 +9,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from autosampler.config import CAROUSEL_STEPS_PER_DEGREE, SerialConfig
+from autosampler.config import (CAROUSEL_STEPS_PER_DEGREE, SerialConfig,
+                                Z_STEPS_PER_MM, PIPETTE_1_STEPS_PER_MM, PIPETTE_2_STEPS_PER_MM)
 from autosampler.controllers.interfaces import GrblController
 from autosampler.errors import (
     ConnectionFailure,
@@ -45,6 +46,13 @@ class SerialGrblController(GrblController):
         self._homing_recovery_file = Path(homing_recovery_file)
         self._abort_generation = 0
         self._needs_reconnect = False
+        from autosampler.position_tracking import PositionTracking
+        self._reported_position = PositionTracking()
+        self.build_info: str | None = None
+
+    @property
+    def work_offsets(self):
+        return dict(self._reported_position.offset)
 
     @property
     def connected(self) -> bool:
@@ -59,6 +67,7 @@ class SerialGrblController(GrblController):
             if self.recovery_required:
                 raise RecoveryRequired("Controller fault is latched; connection retained. Secure gravity-loaded axes before deliberate reset/reconnection.")
             return
+        generation = self._abort_generation
         if not self.config.port or not self.config.baud_rate:
             raise ConnectionFailure("GRBL serial port/baud rate is not configured.")
         if self._homing_recovery_file.exists():
@@ -73,19 +82,49 @@ class SerialGrblController(GrblController):
                 self.config.port, baudrate=self.config.baud_rate, timeout=self.config.timeout_s,
                 write_timeout=self.config.timeout_s,
             )
-            if self._homing_recovery_file.exists():
-                # USB/bridge reconnection does not necessarily reset the controller.
-                self._serial.write(b"\x18")
-            time.sleep(2.0)  # GRBL startup banner/reset interval
-            self._serial.reset_input_buffer()
         except ImportError as exc:
             raise ConnectionFailure("pyserial is required for real hardware mode.") from exc
         except Exception as exc:
             if isinstance(exc, PermissionError) or "permission" in str(exc).lower() or "access is denied" in str(exc).lower():
                 raise SerialPermissionError(serial_permission_message("GRBL", self.config.port)) from exc
             raise ConnectionFailure(f"Could not connect to GRBL: {exc}") from exc
+        if generation != self._abort_generation:
+            raise OperationAborted("Connect cancelled by Abort before device verification.")
         self._needs_reconnect = False
+        self._reported_position.invalidate()
         try:
+            # A bridge reconnect need not produce a banner. Observe startup first,
+            # then require GRBL's read-only identity reply before recovery writes.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                raw = self._serial.readline()
+                if not raw or raw.lower().startswith(b"grbl"):
+                    break
+            identity = []
+            self._line("$I", response_timeout_s=self.config.timeout_s, on_response=identity.append)
+            if not any(line.startswith("[VER:") and line.endswith("]") for line in identity):
+                raise RecoveryRequired("Selected device did not identify as GRBL; no settings or reset sent.")
+            self.build_info = "\n".join(line for line in identity if line.startswith("["))
+            if self._homing_recovery_file.exists():
+                record = json.loads(self._homing_recovery_file.read_text(encoding="utf-8"))
+                if record.get("build_info") and record["build_info"] != self.build_info:
+                    raise RecoveryRequired("Recovery record belongs to a different GRBL build; no reset or settings sent.")
+                self._serial.write(b"\x18")
+                # This reset is the existing explicit pending-settings recovery.
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    raw = self._serial.readline()
+                    if raw.lower().startswith(b"grbl"):
+                        break
+                    if not raw:
+                        raise RecoveryRequired("No GRBL startup banner after explicit recovery reset.")
+                else:
+                    raise RecoveryRequired("No GRBL startup banner after explicit recovery reset.")
+            report = self.status()
+            if generation != self._abort_generation:
+                raise OperationAborted("Connect cancelled by Abort during device verification.")
+            if report[1:].split("|", 1)[0].rstrip(">").split(":", 1)[0] not in ("Idle", "Alarm"):
+                raise RecoveryRequired("Controller has unfinished motion; secure axes and use deliberate Recover/reset.")
             self._restore_homing_settings()
         except Exception:
             # Preserve the live transport for diagnostics. Closing/reopening it
@@ -97,6 +136,7 @@ class SerialGrblController(GrblController):
         if self._serial:
             self._serial.close()
         self._serial = None
+        self._reported_position.invalidate()
 
     def _require(self):
         if not self.connected:
@@ -128,6 +168,7 @@ class SerialGrblController(GrblController):
                 self._connection_lost(exc)
             while True:
                 if deadline is not None and time.monotonic() >= deadline:
+                    self._needs_reconnect = True
                     raise SerialTimeout(f"Timed out waiting for GRBL response to {command!r}.")
                 try:
                     raw = serial_port.readline()
@@ -138,12 +179,15 @@ class SerialGrblController(GrblController):
                 if not raw:
                     if deadline is not None and time.monotonic() < deadline:
                         continue
+                    self._needs_reconnect = True
                     raise SerialTimeout(f"Timed out waiting for GRBL response to {command!r}.")
                 response = raw.decode("ascii", errors="replace").strip()
                 if response.lower().startswith("grbl"):
                     log.error("GRBL restarted during %r: %s", command, response)
                     self._needs_reconnect = True
                     raise RecoveryRequired("Controller restarted; reconnect and Home are required.")
+                if response.startswith("<"):
+                    self._reported_position.ingest(response)
                 if on_response is None:
                     log.info("GRBL < %s", response)
                 low = response.lower()
@@ -176,11 +220,13 @@ class SerialGrblController(GrblController):
                 if report.lower().startswith("grbl"):
                     self._needs_reconnect = True
                     log.error("GRBL restart observed in status: %s", report)
-                    return report
+                    raise RecoveryRequired("Controller restarted; reconnect and Home are required.")
                 if report.startswith("<") and report.endswith(">"):
+                    self._reported_position.ingest(report)
                     return report
                 if report.startswith("ALARM:"):
-                    return report
+                    self._needs_reconnect = True
+                    raise ControllerAlarm(report)
                 log.warning("GRBL status ignored outstanding response: %s", report)
             raise SerialTimeout("Timed out waiting for GRBL status.")
 
@@ -192,7 +238,9 @@ class SerialGrblController(GrblController):
     def wait_for_axis_position(self, axis: str, target: float, cancelled=None, timeout_s: float = 300.0) -> None:
         from autosampler.position_tracking import PositionTracking
         tracker = PositionTracking()
+        tracker.offset = dict(self._reported_position.offset)
         deadline = time.monotonic() + timeout_s
+        unusable_reports = 0
         while True:
             if cancelled and cancelled():
                 raise OperationAborted("Position wait cancelled.")
@@ -212,6 +260,9 @@ class SerialGrblController(GrblController):
             if not tracker.ingest(report) or tracker.controller_state not in ("Idle", "Run", "Jog"):
                 raise RecoveryRequired(f"Positioning interrupted: {report}")
             actual = tracker.work.get(axis)
+            unusable_reports = unusable_reports + 1 if actual is None else 0
+            if unusable_reports >= 5:
+                raise RecoveryRequired(f"No usable {axis} work coordinate in five status reports; check axis format and WCO: {report}")
             if tracker.controller_state == "Idle" and actual is not None and math.isclose(actual, target, abs_tol=.002, rel_tol=0):
                 log.info("MOTION_CONFIRMED axis=%s target=%g reported_work=%g state=Idle", axis, target, actual)
                 return
@@ -235,10 +286,16 @@ class SerialGrblController(GrblController):
         self._ready_for_commands()
         settings = self._read_settings()
         problems = []
+        expected_resolution = {"Z": Z_STEPS_PER_MM, "A": PIPETTE_1_STEPS_PER_MM, "B": PIPETTE_2_STEPS_PER_MM}
         for axis in axes:
             if axis not in "XYZAB":
                 raise ControllerError(f"Unsupported homing axis {axis!r}.")
             index = "XYZAB".index(axis)
+            expected = expected_resolution.get(axis)
+            reported = settings.get(100 + index)
+            if expected is not None and reported is not None and not math.isclose(reported, expected, rel_tol=1e-6):
+                log.warning("STEPS_PER_UNIT_MISMATCH %s: GRBL $%d=%g, application default=%g. Verify conversion and hardware; no resolution setting changed.",
+                            axis, 100 + index, reported, expected)
             keys = (24, 25, 100 + index, 110 + index)
             if any(k not in settings or not math.isfinite(settings[k]) or settings[k] <= 0 for k in keys):
                 raise ControllerError(f"Cannot validate {axis} homing: positive finite $24, $25, ${100 + index} and ${110 + index} settings are required. No homing started.")
@@ -264,7 +321,7 @@ class SerialGrblController(GrblController):
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".tmp")
         with temporary.open("w", encoding="utf-8") as stream:
-            json.dump({"port": self.config.port, "settings": originals}, stream)
+            json.dump({"port": self.config.port, "build_info": self.build_info, "settings": originals}, stream)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
@@ -277,6 +334,8 @@ class SerialGrblController(GrblController):
             record = json.loads(path.read_text(encoding="utf-8"))
             if record["port"] != self.config.port:
                 raise ValueError("Recovery record belongs to another serial port; reconnect the original controller.")
+            if record.get("build_info") and record["build_info"] != self.build_info:
+                raise ValueError("Recovery record belongs to a different GRBL build; settings were not restored.")
             originals = {int(key): float(value) for key, value in record["settings"].items()}
             if not originals or set(originals) - {25, 110, 112} or any(not math.isfinite(v) or v <= 0 for v in originals.values()):
                 raise ValueError("Invalid homing recovery settings")
@@ -343,7 +402,7 @@ class SerialGrblController(GrblController):
         log.error("Homing %s did not complete: %s: %s", command, type(exc).__name__, exc)
         # A reset can release a gravity-loaded axis. Request hold without reset,
         # keep diagnostics connected, and never claim homing was stopped by '!'.
-        if self.connected and not self._needs_reconnect:
+        if self.connected:
             try:
                 self.hold_for_fault()
             except Exception:

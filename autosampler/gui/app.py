@@ -26,7 +26,7 @@ from autosampler.vessels.models import Vessel, VesselCategory, VesselType
 from autosampler.worker import MachineWorker
 from autosampler.calibration import measurements, get_value, aspiration_measurement_help
 from autosampler.remote_serial import DEFAULT_GLOVEBOX_TARGET, discover_remote_devices
-from autosampler.errors import OperationAborted
+from autosampler.errors import OperationAborted, ValidationError
 
 APP_ICON_PATH = Path(__file__).resolve().parent.parent / "assets" / "app_icon.png"
 
@@ -679,6 +679,7 @@ class AutosamplerWindow(QMainWindow):
         layout.addWidget(self.vessel_table, 1)
         buttons = QHBoxLayout()
         save, reset = QPushButton("Apply vessel setup"), QPushButton("New Session / Reset")
+        self.apply_vessels_button, self.reset_session_button = save, reset
         save.clicked.connect(self.save_vessels)
         reset.clicked.connect(self.reset_session)
         buttons.addWidget(save)
@@ -1004,7 +1005,7 @@ class AutosamplerWindow(QMainWindow):
                 "Calibration unlock",
                 "Send GRBL $X and allow relative manual jogging without homing?\n\n"
                 "Machine coordinates will remain UNKNOWN. Automated commands stay disabled. "
-                "Confirm the carriage can move safely before continuing.",
+                "Confirm the carriage can move safely before continuing. X jogging requires Z homed and at collision-free clearance.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -1114,9 +1115,10 @@ class AutosamplerWindow(QMainWindow):
     @Slot()
     def save_vessels(self):
         try:
+            if self._command_inflight or self.worker.busy or self.machine.state.current_operation:
+                raise ValidationError("Wait for the current operation to finish.")
             inventory = Inventory(self._vessels_from_table())
-            self.machine.store.save(inventory)
-            self.machine.inventory = inventory
+            self.machine.apply_inventory(inventory)
             self._vessel_table_dirty = False
             self._refresh_measurements()
             self._update_vessel_status()
@@ -1198,6 +1200,13 @@ class AutosamplerWindow(QMainWindow):
 
     def _update_vessel_status(self):
         issue = self._vessel_setup_issue()
+        uncertain = self.machine.inventory.unverified_sources
+        dump_required = self.machine.inventory.dump_required
+        if uncertain or dump_required:
+            issue = (issue + " " if issue else "") + (
+                f"Unverified liquid state. Dump required: {', '.join(sorted(dump_required)) or 'none'}. "
+                f"Physically verify quantities and Apply vessel setup: {', '.join(sorted(uncertain)) or 'none'}."
+            )
         self.vessel_status.setText(issue or "Vessel setup ready: exactly one Wash and one Dump are configured.")
         self.vessel_status.setStyleSheet(
             "QLabel { color: #b71c1c; font-weight: bold; }" if issue
@@ -1233,6 +1242,8 @@ class AutosamplerWindow(QMainWindow):
 
     @Slot()
     def reset_session(self):
+        if self._command_inflight or self.worker.busy or self.machine.state.current_operation:
+            return
         answer = QMessageBox.question(self, "Reset session", "Clear persistent vessel/liquid state? A backup will be retained.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         if answer == QMessageBox.StandardButton.Yes:
             try:
@@ -1300,14 +1311,16 @@ class AutosamplerWindow(QMainWindow):
                 self._selected_operation_location("source"), self._selected_operation_location("destination")
             )
             buffer_percent = self._draw_buffer()
-            amount, plan = self._amount(), self.machine.plan_transfer(self._amount())
+            amount, plan = self._amount(), self.machine.plan_transfer(self._amount(), buffer_percent=buffer_percent)
             confirmed, prefer_p1 = True, None
             if plan.requires_confirmation:
                 cycles = " + ".join(f"{volume:g}" for volume in plan.cycles_ul)
                 answer = QMessageBox.question(self, "Confirm multi-cycle plan", f"Use {plan.pipette.value}: {cycles} µL?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
                 confirmed = answer == QMessageBox.StandardButton.Yes
-                if not confirmed and amount < self.machine.config.transfer.p1_multi_threshold_ul:
-                    prefer_p1, confirmed = False, True
+                if not confirmed and self.machine.config.pipette_1.max_volume_ul < amount < self.machine.config.transfer.p1_multi_threshold_ul:
+                    alternate = self.machine.plan_transfer(amount, False, buffer_percent)
+                    if not alternate.requires_confirmation:
+                        prefer_p1, confirmed = False, True
             if confirmed:
                 self._submit("transfer", self.machine.transfer, source, destination, amount, True, prefer_p1, buffer_percent)
         except Exception as exc: self.show_error("Transfer error", exc)
@@ -1335,7 +1348,7 @@ class AutosamplerWindow(QMainWindow):
                 return function(abort_generation=generation)
             return function(*args)
         try:
-            self.worker.submit(name, execute)
+            self.worker.submit(name, execute, cancel_on_error=name != "limit status")
         except Exception:
             if name != "limit status":
                 self._command_inflight = None
@@ -1565,7 +1578,14 @@ class AutosamplerWindow(QMainWindow):
             self._set_unlock_checkbox(state.calibration_unlocked)
         homed_axes = ",".join(axis.value for axis in Axis if axis.value in state.homed_axes) or "none"
         self.status_label.setText(f"GRBL {'connected' if state.grbl_connected else 'off'} | Scale {'connected' if state.scale_connected else 'off'} | {state.operation_state.value} ({operation}) | Homed axes {homed_axes} | Fully homed {state.homed} | Trusted {state.position_trusted} | Calibration unlock {state.calibration_unlocked} | X {state.carousel_steps} steps | Scale {reading}")
-        limits_available = state.grbl_connected and state.grbl_status_report is not None
+        self.apply_vessels_button.setEnabled(not busy)
+        self.reset_session_button.setEnabled(not busy)
+        limits_available = (state.grbl_connected and state.grbl_status_report is not None
+                            and state.grbl_status_updated_at is not None
+                            and time.monotonic() - state.grbl_status_updated_at <= state.reported_position.STALE_SECONDS
+                            and not busy
+                            and state.grbl_status_report[1:].split("|", 1)[0].rstrip(">").split(":", 1)[0]
+                            in ("Idle", "Run", "Jog", "Hold", "Door", "Check", "Sleep"))
         for axis, indicator in self.limit_indicators.items():
             if not limits_available:
                 text, background, foreground = f"{axis}  UNKNOWN", "#eeeeee", "#616161"

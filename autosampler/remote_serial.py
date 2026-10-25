@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import subprocess
 import threading
+import time
 from urllib.parse import quote, unquote, urlsplit
 
 from autosampler.devices import SerialDeviceInfo
@@ -100,6 +102,8 @@ class RemoteSerialPort:
                  write_timeout: float | None = None):
         target, path = split_remote_uri(uri)
         self._lock = threading.RLock()
+        self._write_pending = threading.Event()
+        self.timeout = timeout
         self._open = False
         try:
             self._process = subprocess.Popen(
@@ -111,7 +115,7 @@ class RemoteSerialPort:
         try:
             self._exchange({
                 "op": "open", "path": path, "baudrate": baudrate,
-                "timeout": timeout, "bytesize": bytesize, "parity": parity,
+                "timeout": min(timeout, 0.05), "bytesize": bytesize, "parity": parity,
                 "stopbits": stopbits,
                 "write_timeout": timeout if write_timeout is None else write_timeout,
             })
@@ -144,14 +148,26 @@ class RemoteSerialPort:
     def write(self, data: bytes) -> int:
         if not self.is_open:
             raise ConnectionFailure("Glovebox serial port is closed.")
-        reply = self._exchange({"op": "write", "data": base64.b64encode(data).decode("ascii")})
+        self._write_pending.set()
+        try:
+            reply = self._exchange({"op": "write", "data": base64.b64encode(data).decode("ascii")})
+        finally:
+            self._write_pending.clear()
         return int(reply["count"])
 
     def readline(self) -> bytes:
         if not self.is_open:
             raise ConnectionFailure("Glovebox serial port is closed.")
-        reply = self._exchange({"op": "readline"})
-        return base64.b64decode(reply["data"], validate=True)
+        deadline = time.monotonic() + self.timeout
+        result = bytearray()
+        while True:
+            while self._write_pending.is_set():
+                time.sleep(0.001)
+            reply = self._exchange({"op": "readline"})
+            result.extend(base64.b64decode(reply["data"], validate=True))
+            if result.endswith(b"\n") or time.monotonic() >= deadline:
+                return bytes(result)
+            time.sleep(0)  # Let realtime writers acquire the exchange lock between slices.
 
     def reset_input_buffer(self) -> None:
         self._exchange({"op": "reset_input_buffer"})
@@ -183,4 +199,6 @@ def open_serial_port(port: str, **kwargs):
         return RemoteSerialPort(port, **kwargs)
     import serial
 
+    if os.name == "posix":
+        kwargs.setdefault("exclusive", True)
     return serial.Serial(port=port, **kwargs)

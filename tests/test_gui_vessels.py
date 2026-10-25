@@ -263,6 +263,45 @@ def test_gui_draw_and_transfer_pass_override(vessel_window):
     assert len(errors) == 10
 
 
+def test_vessel_mutation_buttons_disabled_while_command_pending(vessel_window):
+    window, machine = vessel_window
+    window._command_inflight = "draw"
+    window._render_state(machine.state)
+    assert not window.apply_vessels_button.isEnabled()
+    assert not window.reset_session_button.isEnabled()
+    window._command_inflight = None
+
+
+def test_limit_indicator_requires_fresh_idle_report(vessel_window, monkeypatch):
+    window, machine = vessel_window
+    window.limit_timer.stop()
+    machine.connect_grbl()
+    machine.refresh_grbl_status()
+    window._render_state(machine.state)
+    assert "open" in window.limit_indicators["X"].text()
+    machine.state.grbl_status_updated_at -= 3
+    window._render_state(machine.state)
+    assert "UNKNOWN" in window.limit_indicators["X"].text()
+    for report in ("ALARM:1", "Grbl 1.1h", "<Home|Pn:X>", "<Alarm|Pn:X>", "<garbage>"):
+        monkeypatch.setattr(machine.grbl, "status", lambda: report)
+        machine.refresh_grbl_status()
+        window._render_state(machine.state)
+        assert "UNKNOWN" in window.limit_indicators["X"].text()
+
+
+def test_declining_buffer_induced_extra_cycle_does_not_switch_pipette(vessel_window, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    window, machine = vessel_window
+    window._require_command_ready = lambda *locations: locations
+    window.operation_fields["amount"].setText("200")
+    window.operation_fields["buffer_percent"].setText("5")
+    submitted = []
+    window._submit = lambda *args: submitted.append(args)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.No)
+    window.transfer()
+    assert not submitted
+
+
 def test_fixed_physical_rack_and_hidden_types(vessel_window):
     window, _machine = vessel_window
     assert window.vessel_table.rowCount() == 26

@@ -16,7 +16,10 @@ class StateStore:
         self.path = Path(path)
 
     def save(self, inventory: Inventory) -> None:
-        payload = {"version": self.VERSION, "vessels": inventory.to_list()}
+        payload = {"version": self.VERSION, "vessels": inventory.to_list(),
+                   "unverified_sources": sorted(inventory.unverified_sources),
+                   "dump_required": sorted(inventory.dump_required),
+                   "pipette_contents_ul": inventory.pipette_contents_ul}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix=self.path.name + ".", suffix=".tmp", dir=self.path.parent)
         try:
@@ -39,7 +42,15 @@ class StateStore:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             if payload.get("version") != self.VERSION:
                 raise ValueError("unsupported state version")
-            return Inventory.from_list(payload["vessels"])
+            inventory = Inventory.from_list(payload["vessels"])
+            inventory.unverified_sources = set(payload.get("unverified_sources", []))
+            inventory.dump_required = set(payload.get("dump_required", []))
+            contents = payload.get("pipette_contents_ul", {"P1": 0.0, "P2": 0.0})
+            import math
+            if set(contents) != {"P1", "P2"} or any(not math.isfinite(v) or v < 0 for v in contents.values()):
+                raise ValueError("invalid pipette contents")
+            inventory.pipette_contents_ul = contents
+            return inventory
         except Exception as exc:
             raise AutosamplerError(f"Could not load state file {self.path}: {exc}") from exc
 

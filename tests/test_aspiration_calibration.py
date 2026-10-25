@@ -89,7 +89,7 @@ def test_draw_positions_tip_at_calculated_depth_below_surface(configured_machine
     m = configured_machine
     m.config.transfer.aspiration_immersion_depth_mm = 2.0
     vessel = m.inventory.get(location)
-    surface_height = m._geometry(vessel).liquid_height_mm(vessel.quantity_ul)
+    surface_height = m._geometry(vessel).liquid_height_mm(vessel.quantity_ul - 100)
     family = "vial" if location == "source" else "beaker"
     bottom = getattr(m.config.aspiration, f"{family}_bottom_mm")
     expected = bottom + m.config.aspiration.z_up_direction * (surface_height - 2)

@@ -201,7 +201,9 @@ def test_reset_report_invalidates_every_axis_and_fresh_status_never_retrusts(con
     serial = SerialGrblController(SerialConfig("test", 115200))
     serial._serial = ScriptedSerial([b"Grbl 1.1h\n", b"<Idle|MPos:0,0,0,0,0>\n"])
     m.grbl = serial
-    m.refresh_grbl_status()
+    from autosampler.errors import RecoveryRequired
+    with pytest.raises(RecoveryRequired):
+        m.refresh_grbl_status()
     assert not m.state.homed_axes and not m.state.homed and not m.state.position_trusted
     assert not m.state.reported_position.references
     assert serial.recovery_required

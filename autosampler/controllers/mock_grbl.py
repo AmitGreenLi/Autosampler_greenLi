@@ -13,13 +13,21 @@ class MockGrblController(GrblController):
     def __init__(self) -> None:
         self._connected = False
         self.positions = {axis.value: 0.0 for axis in Axis}
-        self.work_offsets = {axis.value: 0.0 for axis in Axis}
+        self._work_offsets = {axis.value: 0.0 for axis in Axis}
         self.commands: list[str] = []
         self.alarm: str | None = None
         self.fail_home = False
         self.limit_pins: set[str] = set()
         self.homing_search_rates: list[tuple[str | None, float | None]] = []
         self.settings = {112: 100.0, 122: 10.0, 113: 100.0, 123: 10.0, 114: 100.0, 124: 10.0}
+
+    @property
+    def work_offsets(self):
+        return self._work_offsets
+
+    @work_offsets.setter
+    def work_offsets(self, value):
+        self._work_offsets = value
 
     @property
     def connected(self) -> bool:
